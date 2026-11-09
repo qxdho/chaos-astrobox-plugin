@@ -1,0 +1,17 @@
+{
+  "name": "手环文件管理器",
+  "icon": "icon.png",
+  "version": "0.1.6",
+  "description": "通过 Chaos 原生文件桥浏览、预览、编辑、上传、下载和管理手环文件；支持开发者模式开放 /data 以外的写入路径。",
+  "author": "Searchstars",
+  "website": "",
+  "entry": "astrobox_plugin_band_files.wasm",
+  "wasi_version": 3,
+  "api_level": 4,
+  "permissions": [
+    "canopusconnect.send",
+    "canopusconnect.listen",
+    "device"
+  ],
+  "additional_files": []
+}

@@ -1,0 +1,7 @@
+# Rust build output
+target/
+plugin/target/
+
+# OS noise
+.DS_Store
+

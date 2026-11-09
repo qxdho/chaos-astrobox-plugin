@@ -1,0 +1,17 @@
+[package]
+name = "astrobox-plugin-band-files"
+version = "0.1.6"
+edition = "2024"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.63.0", features = ["async", "async-spawn"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
