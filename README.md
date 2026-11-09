@@ -1,5 +1,9 @@
 # 手环文件管理器（AstroBox 插件 + Chaos 原生文件桥）
 
+> **本仓库只包含 AstroBox 插件部分**：`plugin/` 源码与 `dist/band-files.abp`。
+> 手环侧的 Canopus 模块 `band_files`、`.canopus` 模块包和 p67 安装表盘不在本仓库，
+> 下文中依赖这些文件的安装步骤请参考完整发行包。
+
 > 当前推荐形态：插件连接 Chaos 内置的 CanopusConnect 兼容桥，不再需要 Canopus 模块管理器。
 > 下文 Canopus 安装步骤仅用于旧版兼容。
 
