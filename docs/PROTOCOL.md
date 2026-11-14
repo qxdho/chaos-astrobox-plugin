@@ -1,200 +1,87 @@
-# band_files 协议 v1
+# ChaosConnect v1
 
-CanopusConnect 二进制消息，单条不超过 480 字节。整数均为小端。
+私有命名空间 `ChaosConnect`，与旧插件不兼容。整数均为小端。
 
-```text
-请求： [op:u8][req:u16][payload]
-应答： [op|0x80][req:u16][status:u8][payload]
-事件： [0xC0+n][payload]
-```
+## CCN1帧
 
-路径编码：`[len:u16][UTF-8 bytes]`，不以 NUL 结尾；模块侧限制 255 字节并做词法规整（`.`、`..`、`//`）。
-
-## 状态码
-
-| 值 | 含义 |
+| 偏移 | 字段 |
 |---|---|
-| 0 | Ok |
-| 1 | BadRequest |
-| 2 | NotFound |
-| 3 | Access |
-| 4 | Exist |
-| 5 | NotDir |
-| 6 | IsDir |
-| 7 | NoSpace |
-| 8 | Busy / NotEmpty |
-| 9 | Io |
-| 10 | Crc |
-| 11 | Sequence |
-| 12 | Unsupported |
-| 13 | TooLarge |
+| 0 | `CCN1`，4B magic |
+| 4 | u8 version = 1 |
+| 5 | u8 flags：0请求、1应答、2事件 |
+| 6 | u8 opcode（应答保持请求opcode，不再OR 0x80） |
+| 7 | u8 status，请求为0 |
+| 8 | u16 request_id，事件为0 |
+| 10 | u16 payload长度，最大2304 |
+| 12 | u32 CRC32 |
+| 16 | payload |
 
-## 请求
+CRC32为标准IEEE多项式 `0xEDB88320`，初值和终值异或均为 `0xFFFFFFFF`，覆盖前12B头与payload（跳过CRC字段本身）。完整长度必须等于16+payload长度。拒绝旧CPC2、错误版本、截断、超长、重复目标protobuf字段、溢出varint和CRC错误。
 
-### `0x01 HELLO`
+## AstroBox承载
 
-无 payload。
+使用v4官方 `transport.send(addr, bytes)`，并通过 `register_transport_recv(addr, {channel_id:1, protobuf_typeid:0x4343})` 订阅。权限字符串分别为 `request`、`register_transport_recv`，设备列表另需 `device`。
 
-应答 payload：
+宿主对发送内容使用WearPacket解码再编码，必须使用已定义的字段保存二进制：
 
 ```text
-u8  protocol_version (=1)
-u16 max_data (=448)
-u8  flags (bit0 dev_mode_supported, bit1 rmdir_supported)
-u8  dev_mode
-u16 max_path (=255)
-u32 reserved
+WearPacket.type (field 1) = 0x4343（私有）
+WearPacket.id   (field 2) = connection_prefix:u16 << 16 | request_id:u16
+WearPacket.thirdparty_app (field 22)
+  message_content (field 9)
+    basic_info (field 1)
+      package_name (field 1) = "ChaosConnect"
+      fingerprint (field 2) = empty bytes（required字段）
+    content (field 2) = CCN1帧
 ```
 
-### `0x02 LIST`
+消息进入已认证的SARv2/L2 PB承载。设备只拦截私有type、namespace和正确帧；正常PB、其他L2通道（包括0x43）原样转交系统。**这不是独立L2CAP PSM或裸L2CAP socket协议**；蓝牙具体承载由宿主决定。官方最新宿主源码已实现通用设备传输，旧占位宿主不支持。
 
-```text
-path
-u32 offset
-u8  limit (module caps at 16)
-```
+接收的 `transport-packet` event-payload是**直接的标准Base64字符串**，解码后为WearPacket。应答完整回显ID；事件使用当前连接前缀+低16位0。插件拒绝旧连接前缀和ID不匹配的帧。重新连接先换前缀再HELLO；设备的新HELLO清理原读写事务和开发者模式。
 
-应答：
+## 路径、状态
 
-```text
-u16 total
-u16 offset
-u16 count
-count × {
-  u8  name_len
-  u8  name[name_len]
-  u8  is_dir
-  u32 size
-  u32 mtime
-}
-```
+路径编码为 `[length:u16][UTF-8 bytes]`，单路径不超过255B，无NUL，规整`.`、`..`和重复`/`。上传与复制的临时后缀还需额外空间，过长目标报错。默认只写 `/data`；开发者模式可开放其他实际路径，始终拒绝`/dev`、`/proc`、`/sys`。
 
-模块每次打开目录遍历，跳过 `offset`，最多返回 `limit` 项或填满 480 字节。插件按 `offset + count < total` 继续翻页。
+状态：0成功；1参数；2不存在；3访问拒绝；4已存在；5非目录；6是目录；7空间不足；8忙/非空；9IO；10CRC；11偏移序列；12不支持；13过大。
 
-### `0x03 STAT`
+## 操作
 
-```text
-path
-```
+| opcode | 请求payload | 成功应答payload |
+|---|---|---|
+| 0x01 HELLO | 空 | version:u8, max_data:u16, flags:u8, dev_mode:u8, max_path:u16, window:u32 |
+| 0x02 LIST | path, offset:u32, limit:u8（1–16） | total:u16, offset:u16, count:u16, entries |
+| 0x03 STAT | path | is_dir:u8, size:u32, mtime:u32 |
+| 0x04 MKDIR | path | 空 |
+| 0x05 REMOVE | path | 空 |
+| 0x06 RMDIR | path（只删除空目录） | 空 |
+| 0x07 RENAME | source_path, target_path | 空 |
+| 0x08 COPY | source_path, target_path, overwrite:u8 | 空 |
+| 0x10 OPEN_READ | path | size:u32 |
+| 0x11 READ | offset:u32, length:u16 | 实际数据bytes |
+| 0x12 CLOSE_READ | 空 | 空 |
+| 0x20 OPEN_WRITE | path, expected_size:u32, overwrite:u8 | 空 |
+| 0x21 WRITE | offset:u32, data | committed_offset:u32, cumulative_crc32:u32 |
+| 0x22 COMMIT | expected_crc32:u32 | 空 |
+| 0x23 ABORT | 空 | 空 |
+| 0x30 PING | 空 | 1:u8 |
+| 0x31 BENCH_ECHO | 测试数据，长度≤max_data | 原样回显测试数据 |
+| 0x40 SET_DEV | enabled:u8 | 空 |
+| 0x41 GET_DEV | 空 | enabled:u8 |
 
-应答：
+LIST每项：name_len:u8、name、is_dir:u8、size:u32、mtime:u32。目录帧也遵守协商容量；不得跳过放不下的大条目再打包后面的条目，否则offset会导致丢项。计数0但仍有条目时明确报TooLarge，不无限分页。
 
-```text
-u8  is_dir
-u32 size
-u32 mtime
-```
+进度事件flags=2、opcode=0xC1，payload为written:u32、cumulative_crc32:u32。它只更新显示，不能代替每块WRITE ACK或COMMIT应答。
 
-### `0x04 MKDIR` / `0x05 REMOVE` / `0x06 RMDIR`
+## 窗口、可靠性与200 kb/s验收
 
-```text
-path
-```
+- max_data=`min(2048, SAR协商容量-128)`，窗口8。这里是SAR帧限额，不是Bluetooth L2CAP MTU。保留头部余量满足固件 `payload_len+1 < SAR_capacity` 检查。
+- 上传数据块顺序入队，设备校验偏移并处理短写；插件记录每个request_id的offset/长度，可以容忍ACK乱序，但全部ACK确认后才能COMMIT。
+- 上传先写同目录独有临时文件，再核对总大小/CRC、close、rename；覆盖失败不先删原文件。ABORT、新HELLO和设备会话结束清理临时文件。
+- 下载允许8个READ在途，按偏移组装并串行await本地保存，防止并发回调导致落盘乱序；块长度必须精确符合协商值与文件剩余长度。
+- 原生RX/TX队列分别12/16，处理前预留应答空间。发送在BT loop；原生发送会就地加密，因此每次重试从保留的明文复制，不二次加密旧密文。断连或开关停止推进epoch，旧帧不能污染新会话。
+- 上传/下载应答超时15s取消；插件传输中禁止换设备。没有宣称断点续传。
+- 1MiB链路回显测速使用真实传输和单调时钟，不写手环文件；显示单方向有效 `bytes/seconds`、KB/s、kb/s。200 kb/s=25,000 B/s，200 KB/s是另外一个目标。
+- 编译、CPU测试、理论窗口带宽、ARM模拟均不能证明无线达标。当前200 kb/s尚待真机验证；回显测速与实际上传/下载需分别记录。
 
-`RMDIR` 仅删除空目录，需要 FS 服务版本 ≥2。
-
-### `0x08 COPY`
-
-```text
-from_path
-to_path
-u8 overwrite
-```
-
-模块内部流式复制（512 字节块），写到目标同目录临时文件，成功后 rename；目录返回 `IsDir`。
-
-### `0x07 RENAME`
-
-```text
-from_path
-to_path
-```
-
-### `0x10 OPEN_READ`
-
-```text
-path
-```
-
-应答：
-
-```text
-u32 size
-```
-
-模块同一时间只保留一个读句柄；新的 `OPEN_READ` 会关闭旧的。
-
-### `0x11 READ`
-
-```text
-u32 offset
-u16 length (≤448)
-```
-
-应答 payload 为原始字节，长度可小于请求长度（文件尾）。
-
-### `0x12 CLOSE_READ`
-
-无 payload。
-
-### `0x20 OPEN_WRITE`
-
-```text
-path
-u32 expected_size
-u8  overwrite
-```
-
-模块在目标同目录创建临时文件 `.bftmp`（已存在则先删），后续写入该临时文件。`overwrite=0` 且目标存在返回 `Exist`。
-
-### `0x21 WRITE`
-
-```text
-u32 offset
-bytes data
-```
-
-要求 `offset == 已写入字节数`，否则返回 `Sequence`。模块累计 CRC32；每 8 KiB 或写满时发送事件：
-
-```text
-[0xC1][u32 written][u32 crc_running]
-```
-
-### `0x22 COMMIT`
-
-```text
-u32 crc32_final
-```
-
-`crc32_final` 为 `crc_running ^ 0xFFFFFFFF`（标准 CRC32）。模块核对大小与 CRC，`sync`、关闭、`rename(temp, target)`。若目标存在且 `overwrite=1`，rename 返回 `Exist` 时先删除目标再重试。
-
-### `0x23 ABORT`
-
-关闭并删除临时文件。
-
-### `0x30 PING`
-
-应答 1 字节 `0x01`。
-
-### `0x40 SET_DEV`
-
-```text
-u8 enabled
-```
-
-持久化到模块 KV（键 `dev_mode`）。成功应答无 payload。
-
-## 路径策略
-
-模块在解析路径后、调用 `ctx->fs` 前检查：
-
-- 永远拒绝：`/data/canopus`、`/canopus`、`/dev`、`/proc`、`/sys`（含子路径，大小写不敏感）。
-- 默认只允许写 `/data` 及其子路径。
-- 开发者模式允许写其它绝对路径，但上述受保护路径仍拒绝。
-- 所有路径必须是绝对路径；`..` 不得越过根。
-
-## 限制
-
-- 单文件大小用 u32 表示；超过 4 GiB 不支持。
-- 目录项名称受固件 `canopus_fs_dirent.name[64]` 限制（最多 63 字节）。
-- 模块同时只有一个读句柄和一个写句柄。
+固定互通向量保存在`CHAOSCONNECT-V1.hex`（插件位于`plugin/tests/`）：第一行为HELLO请求CCN1帧（request_id=0x1234），第二行为同一帧的宿主protobuf承载（packet_id=0x12341234）。两仓库的向量逐字节相同，C与Rust测试分别核对。

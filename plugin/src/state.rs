@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::protocol;
 
@@ -67,6 +68,19 @@ pub struct Upload {
     pub started: bool,
     pub timer: Option<u64>,
     pub reported: u32,
+    pub inflight: HashMap<u16, (u32, usize)>,
+    pub clock: Option<Instant>,
+    pub last_ack: Instant,
+    pub committing: bool,
+}
+
+impl Upload {
+    pub fn ready_commit(&self)->bool{self.started&&!self.committing&&self.offset==self.data.len()&&self.inflight.is_empty()}
+    pub fn acknowledge(&mut self,req:u16,done:u32)->Result<bool,()>{
+        let Some((offset,n))=self.inflight.get(&req).copied()else{return Ok(false);};
+        if done!=offset+n as u32{return Err(());}
+        self.inflight.remove(&req);self.reported=self.reported.max(done);self.last_ack=Instant::now();Ok(true)
+    }
 }
 
 pub struct Download {
@@ -80,6 +94,14 @@ pub struct Download {
     pub inflight: HashMap<u16, u32>,
     pub written: u32,
     pub closing: bool,
+    pub clock: Instant,
+    pub last_ack: Instant,
+}
+
+#[derive(Clone)]
+pub struct Benchmark {
+    pub sent:u32,pub received:u32,pub inflight:HashMap<u16,(u32,usize)>,
+    pub clock:Instant,pub last_ack:Instant,
 }
 
 pub enum Pending {
@@ -120,6 +142,8 @@ pub struct State {
     pub devices: Vec<DeviceInfo>,
     pub addr: String,
     pub connected: bool,
+    pub chunk: usize,
+    pub speed: String,
     pub dev_mode: bool,
     pub path: String,
     pub entries: Vec<Entry>,
@@ -132,6 +156,7 @@ pub struct State {
     pub pending: Option<Pending>,
     pub pending_req: u16,
     pub upload: Option<Upload>,
+    pub benchmark: Option<Benchmark>,
     pub download: Option<Download>,
     pub preview: Option<Preview>,
     pub busy: bool,
@@ -145,18 +170,21 @@ impl Default for State {
             devices: Vec::new(),
             addr: String::new(),
             connected: false,
+            chunk: protocol::CHUNK,
+            speed: String::new(),
             dev_mode: false,
             path: "/data".to_string(),
             entries: Vec::new(),
             total: 0,
             page: 0,
             loading: false,
-            status: "请选择已连接的手环，并确认 Canopus 模块 band_files 已启用。".to_string(),
+            status: "请选择已连接的手环，并在 Chaos 设置中开启文件桥。".to_string(),
             status_error: false,
             detail: None,
             pending: None,
             pending_req: 0,
             upload: None,
+            benchmark: None,
             download: None,
             preview: None,
             busy: false,
@@ -179,6 +207,8 @@ pub fn snapshot() -> State {
         devices: state.devices.clone(),
         addr: state.addr.clone(),
         connected: state.connected,
+        chunk: state.chunk,
+        speed: state.speed.clone(),
         dev_mode: state.dev_mode,
         path: state.path.clone(),
         entries: state.entries.clone(),
@@ -191,6 +221,7 @@ pub fn snapshot() -> State {
         pending: None,
         pending_req: state.pending_req,
         upload: None,
+        benchmark: state.benchmark.clone(),
         download: None,
         preview: state.preview.as_ref().map(|preview| Preview {
             path: preview.path.clone(),
@@ -207,7 +238,7 @@ pub fn snapshot() -> State {
             kind: TransferKind::Upload,
             name: upload.name.clone(),
             target: upload.target.clone(),
-            done: upload.offset as u32,
+            done: upload.reported,
             total: upload.data.len() as u32,
         }).or_else(|| state.download.as_ref().map(|download| TransferInfo {
             kind: TransferKind::Download,
@@ -271,4 +302,15 @@ pub fn progress_text(done: u32, total: u32) -> String {
         protocol::format_size(total),
         (done as u64 * 100 / total as u64).min(100)
     )
+}
+
+#[cfg(test)] mod transfer_tests{
+ use super::*;
+ #[test] fn upload_requires_all_matching_acknowledgements_before_commit(){
+  let mut u=Upload{target:"/data/t".into(),name:"t".into(),data:vec![1;4096],offset:4096,crc:0,overwrite:false,started:true,timer:None,reported:0,inflight:HashMap::from([(10,(0,2048)),(11,(2048,2048))]),clock:Some(Instant::now()),last_ack:Instant::now(),committing:false};
+  assert!(!u.ready_commit());assert_eq!(u.acknowledge(11,4096),Ok(true));assert!(!u.ready_commit());
+  assert_eq!(u.acknowledge(11,4096),Ok(false));assert_eq!(u.acknowledge(10,99),Err(()));assert_eq!(u.inflight.len(),1);
+  assert_eq!(u.acknowledge(10,2048),Ok(true));assert!(u.ready_commit());assert_eq!(u.reported,4096);
+  u.committing=true;assert!(!u.ready_commit());
+ }
 }

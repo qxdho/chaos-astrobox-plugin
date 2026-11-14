@@ -78,7 +78,7 @@ pub fn build(state: &State) -> View {
 
     let busy = state.busy || state.transfer.is_some();
     let mut header = row()
-        .child(title("手环文件管理器", 22).grow())
+        .child(title("ChaosConnect", 22).grow())
         .child(badge(
             if state.connected { "已连接" } else { "未连接" },
             if state.connected { OK } else { MUTED },
@@ -93,6 +93,8 @@ pub fn build(state: &State) -> View {
         header = header.child(badge("开发者模式", DANGER));
     }
     root = root.child(header);
+
+    if !state.speed.is_empty() { root=root.child(muted(&state.speed)); }
 
     if let Some(select) = device_select(state) {
         root = root.child(card().child(muted("设备")).child(select));
@@ -117,7 +119,7 @@ pub fn build(state: &State) -> View {
                 ))
                 .child(
                     row()
-                        .child(button("连接模块", "action:connect", true))
+                        .child(button("连接ChaosConnect", "action:connect", true))
                         .child(button("刷新设备", "action:refresh-devices", false)),
                 ),
         );
@@ -138,6 +140,8 @@ pub fn build(state: &State) -> View {
         root = root.child(preview);
     }
 
+    root=root.child(row().child(button("链路测速（1 MiB）","action:benchmark",false).disabled_if(busy))
+        .child(button("取消测速","action:cancel-benchmark",false).disabled_if(state.benchmark.is_none())));
     root = root.child(list_card(state));
     root = root.child(status_line(state));
     root
@@ -158,9 +162,9 @@ fn path_bar(state: &State) -> View {
                 .child(button("刷新", "action:refresh", false)),
         )
         .child(muted(if state.dev_mode {
-            "可写：所有路径（/dev、/proc、/sys、/data/canopus 除外）"
+            "可写：所有路径（/dev、/proc、/sys 除外）"
         } else {
-            "可写：/data（/data/canopus 除外）；切到开发者模式可开放其他路径"
+            "可写：/data；切到开发者模式可开放其他路径"
         }))
 }
 

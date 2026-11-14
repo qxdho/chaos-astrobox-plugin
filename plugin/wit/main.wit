@@ -1,4 +1,4 @@
-﻿package astrobox:main;
+package astrobox:main;
 
 // 傻逼vsc会在这报错 别管
 
@@ -144,4 +144,16 @@ world psys-world-v4-canopusconnect {
 // import。插件不要用这个世界，要用 `psys-world-v4-canopusconnect`。
 world psys-plugin-canopusconnect-export {
   export astrobox:psys-plugin-v4/canopusconnect;
+}
+
+// ChaosConnect uses the official generic device transport, without Canopus imports.
+world chaos-connect-v4 {
+  import astrobox:psys-host-v4/device;
+  import astrobox:psys-host-v4/transport;
+  import astrobox:psys-host-v4/register;
+  import astrobox:psys-host-v4/dialog;
+  import astrobox:psys-host-v4/timer;
+  import astrobox:psys-host-v4/ui;
+  export astrobox:psys-plugin-v4/lifecycle;
+  export astrobox:psys-plugin-v4/event;
 }

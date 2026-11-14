@@ -1,6 +1,6 @@
 [package]
-name = "astrobox-plugin-band-files"
-version = "0.1.6"
+name = "astrobox-plugin-chaos-connect"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -9,9 +9,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = { version = "0.63.0", features = ["async", "async-spawn"] }
+base64 = "0.22"
 
 [profile.release]
 opt-level = "s"
 lto = true
 strip = true
 panic = "abort"
+
+[dev-dependencies]
+prost = "0.14"

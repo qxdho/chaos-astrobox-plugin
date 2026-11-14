@@ -1,15 +1,17 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use base64::Engine;
 use std::sync::Mutex;
 
 use crate::astrobox::psys_host_v4::{
-    canopusconnect::{self as host_connect, Payload},
+    transport, register,
     device,
     dialog::{self, DialogButton, DialogInfo, DialogStyle, DialogType, FilterConfig, PickConfig},
     timer, ui,
 };
 use crate::exports::astrobox::psys_plugin_v4::{
-    canopusconnect as plugin_connect, event, event::EventType, lifecycle,
+    event, event::EventType, lifecycle,
 };
 use crate::protocol::*;
 use crate::state::{
@@ -23,17 +25,21 @@ mod view;
 
 wit_bindgen::generate!({
     path: "wit",
-    world: "psys-world-v4-canopusconnect",
+    world: "chaos-connect-v4",
     generate_all,
 });
 
 static NEXT_REQ: AtomicU16 = AtomicU16::new(1);
+static PREFIX: AtomicU32 = AtomicU32::new(0);
 static UPLOAD_BUSY: AtomicBool = AtomicBool::new(false);
+static RECEIVE_BUSY: AtomicBool = AtomicBool::new(false);
+static RECEIVE_QUEUE: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
+static WATCHDOG_TIMER: Mutex<Option<u64>> = Mutex::new(None);
 static UPLOAD_TIMER: Mutex<Option<u64>> = Mutex::new(None);
 
 const EVENT_DEVICE: &str = "input:device";
 
-struct BandFilesPlugin;
+struct ChaosConnectPlugin;
 
 fn next_req() -> u16 {
     NEXT_REQ.fetch_add(1, Ordering::Relaxed)
@@ -44,6 +50,13 @@ fn rerender() {
     if let Some(root) = &snapshot.root {
         ui::render(root, page::build(&snapshot).into_element());
     }
+}
+
+static PROGRESS_RENDER:Mutex<Option<Instant>>=Mutex::new(None);
+fn rerender_progress(){
+    let draw={let mut last=PROGRESS_RENDER.lock().unwrap_or_else(|e|e.into_inner());
+        if last.is_some_and(|t|t.elapsed().as_millis()<100){false}else{*last=Some(Instant::now());true}};
+    if draw{rerender();}
 }
 
 fn set_pending(pending: Pending, req: u16) {
@@ -64,12 +77,15 @@ fn take_pending(req: u16) -> Option<Pending> {
 }
 
 async fn send_req(op: u8, req: u16, payload: &[u8]) -> Result<(), String> {
+    if payload.len()>MAX_PAYLOAD{return Err("消息或路径超过协议容量".into());}
+    if op==OP_WRITE&&!state::with_state(|s|s.upload.as_ref().is_some_and(|u|u.inflight.contains_key(&req))){return Err("上传任务已取消".into());}
     let addr = state::selected_addr();
     if addr.is_empty() {
         return Err("没有选择设备".to_string());
     }
     let frame = encode_request(op, req, payload);
-    host_connect::send(addr, MODULE_ID.to_string(), Payload::Binary(frame)).await
+    let id=PREFIX.load(Ordering::SeqCst) | req as u32;
+    transport::send(addr, wrap_packet(&frame,id)).await
 }
 
 async fn request(op: u8, payload: &[u8], pending: Pending) -> Result<(), String> {
@@ -94,6 +110,12 @@ async fn refresh_devices() {
             name: item.name,
         })
         .collect::<Vec<_>>();
+    let old=state::selected_addr();
+    if !old.is_empty()&&!devices.iter().any(|d|d.addr==old){
+        if state::with_state(|s|s.upload.is_some()){cancel_upload_with("设备断开，已取消上传。".into()).await;}
+        if state::with_state(|s|s.download.is_some()){cancel_download().await;}
+        if state::with_state(|s|s.benchmark.is_some()){end_benchmark(Some("设备已断开。".into()));}
+    }
     state::with_state(|state| {
         state.devices = devices;
         if state.devices.is_empty() {
@@ -116,7 +138,7 @@ async fn refresh_devices() {
     rerender();
 }
 
-async fn connect_module() {
+async fn connect_bridge() {
     let addr = state::selected_addr();
     if addr.is_empty() {
         state::set_status("请先选择已连接的手环。", true);
@@ -126,14 +148,18 @@ async fn connect_module() {
     state::with_state(|state| {
         state.connected = false;
         state.busy = true;
-        state.status = "正在连接 band_files 模块…".to_string();
+        state.status = "正在连接 ChaosConnect…".to_string();
         state.status_error = false;
     });
     rerender();
-    if let Err(error) = host_connect::listen(addr.clone(), MODULE_ID.to_string()).await {
+    let nonce=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+    PREFIX.store((nonce.rotate_left(11)&0xffff0000).max(0x10000),Ordering::SeqCst);
+    if let Err(error) = register::register_transport_recv(addr.clone(), register::TransportRecvFiler {
+        xiaomi_vela_v5_channel_id: 1, xiaomi_vela_v5_protobuf_typeid: PB_TYPE,
+    }).await {
         state::with_state(|state| {
             state.busy = false;
-            state.status = format!("无法监听模块：{error}。请确认 Chaos 文件桥已启动，然后重试。");
+            state.status = format!("无法监听设备传输：{error}。请确认 Chaos 文件桥已启动，然后重试。");
             state.status_error = true;
         });
         rerender();
@@ -154,7 +180,7 @@ async fn connect_module() {
     let _ = timer::set_timeout(8_000, "hello-timeout");
 }
 
-async fn reconnect_module() {
+async fn reconnect_bridge() {
     let addr = state::selected_addr();
     if addr.is_empty() {
         state::set_status("请先选择已连接的手环。", true);
@@ -174,11 +200,9 @@ async fn reconnect_module() {
         state.status_error = false;
     });
     rerender();
-    // 先释放当前监听，再重新 listen + HELLO。unlisten 在“已经没在监听”时
-    // 可能返回错误，这种情况下继续重连即可。
-    let _ = host_connect::unlisten(addr, MODULE_ID.to_string()).await;
+    // 新HELLO使用不同的连接前缀，旧会话延迟应答不能推进当前传输。
     state::clear_connection();
-    connect_module().await;
+    connect_bridge().await;
 }
 
 async fn load_dir(path: String) {
@@ -284,7 +308,7 @@ async fn request_preview_read(offset: u32) {
             .map(|preview| (preview.size, preview.name.clone()))
             .unwrap_or((0, String::new()))
     });
-    let len = CHUNK.min(size.saturating_sub(offset) as usize) as u16;
+    let len = state::with_state(|s|s.chunk).min(size.saturating_sub(offset) as usize) as u16;
     if len == 0 {
         finish_preview_read();
         return;
@@ -330,8 +354,8 @@ async fn send_rename(path: String, new_name: String) {
     let mut payload = Vec::new();
     push_str(&mut payload, &path);
     push_str(&mut payload, &new_path);
-    if payload.len() + 3 > 480 {
-        state::set_status("路径太长，无法在单条 480 字节消息内完成重命名。", true);
+    if payload.len() > MAX_PAYLOAD {
+        state::set_status("路径过长，无法完成重命名。", true);
         rerender();
         return;
     }
@@ -347,8 +371,8 @@ async fn send_copy(path: String, new_name: String) {
     push_str(&mut payload, &path);
     push_str(&mut payload, &target);
     payload.push(1);
-    if payload.len() + 3 > 480 {
-        state::set_status("路径太长，无法在单条 480 字节消息内完成复制。", true);
+    if payload.len() > MAX_PAYLOAD {
+        state::set_status("路径过长，无法完成复制。", true);
         rerender();
         return;
     }
@@ -525,6 +549,7 @@ async fn start_upload_bytes(target: String, name: String, data: Vec<u8>) {
             started: false,
             timer: None,
             reported: 0,
+            inflight: HashMap::new(), clock: None, last_ack: Instant::now(), committing: false,
         });
         state.status = format!("准备保存 {name}…");
         state.status_error = false;
@@ -607,6 +632,7 @@ async fn start_upload() {
             started: false,
             timer: None,
             reported: 0,
+            inflight: HashMap::new(), clock: None, last_ack: Instant::now(), committing: false,
         });
         state.status = format!("准备上传 {name}…");
         state.status_error = false;
@@ -638,68 +664,74 @@ async fn send_open_write(overwrite: bool) {
     }
 }
 
+const BENCH_BYTES:u32=1024*1024;
+static BENCH_BUSY:AtomicBool=AtomicBool::new(false);
+static BENCH_TIMER:Mutex<Option<u64>>=Mutex::new(None);
+fn end_benchmark(reason:Option<String>){
+    if let Some(id)=BENCH_TIMER.lock().unwrap_or_else(|e|e.into_inner()).take(){timer::clear_timer(id);}
+    state::with_state(|s|{if let Some(b)=s.benchmark.take(){
+        s.speed=speed_text(b.received,b.clock);
+        s.status=reason.clone().unwrap_or_else(||format!("已回显校验1 MiB，单方向有效速度：{}",s.speed));
+        s.status_error=reason.is_some();s.busy=false;}});rerender();
+}
+async fn start_benchmark(){
+    if state::with_state(|s|s.busy||s.upload.is_some()||s.download.is_some()){return;}
+    state::with_state(|s|{s.busy=true;s.benchmark=Some(state::Benchmark{sent:0,received:0,inflight:HashMap::new(),clock:Instant::now(),last_ack:Instant::now()});s.status="正在进行1 MiB链路回显测试（不会写入手环文件）…".into();s.status_error=false;});
+    let id=timer::set_interval(100,"benchmark");
+    if id==0{end_benchmark(Some("无法启动测速计时器。".into()));return;}
+    *BENCH_TIMER.lock().unwrap_or_else(|e|e.into_inner())=Some(id);drive_benchmark().await;
+}
+async fn drive_benchmark(){
+    if BENCH_BUSY.swap(true,Ordering::SeqCst){return;}
+    if state::with_state(|s|s.benchmark.as_ref().is_some_and(|b|b.last_ack.elapsed().as_secs()>=15)){
+        BENCH_BUSY.store(false,Ordering::SeqCst);end_benchmark(Some("测速等待应答超时，请检查连接。".into()));return;
+    }
+    for _ in 0..WINDOW{
+        let next=state::with_state(|s|{let n=s.chunk;let b=s.benchmark.as_mut()?;if b.sent>=BENCH_BYTES||b.inflight.len()>=WINDOW{return None;}
+            let offset=b.sent;let n=n.min((BENCH_BYTES-offset)as usize);let req=next_req();b.inflight.insert(req,(offset,n));b.sent+=n as u32;Some((req,offset,n))});
+        let Some((req,offset,n))=next else{break;};
+        let data=(0..n).map(|i|((offset as usize+i)*31)as u8).collect::<Vec<_>>();
+        if let Err(e)=send_req(0x31,req,&data).await{BENCH_BUSY.store(false,Ordering::SeqCst);end_benchmark(Some(format!("测速发送失败：{e}")));return;}
+    }
+    state::with_state(|s|{if let Some(b)=&s.benchmark{s.speed=speed_text(b.received,b.clock);}});
+    BENCH_BUSY.store(false,Ordering::SeqCst);rerender_progress();
+}
+
+fn speed_text(bytes:u32,clock:Instant)->String {
+    let rate=bytes as f64/clock.elapsed().as_secs_f64().max(0.001);
+    format!("{:.1} KB/s · {:.0} kb/s{}",rate/1000.0,rate*8.0/1000.0,if rate>=25000.0{" · 达到200 kb/s"}else{" · 未达到200 kb/s"})
+}
 async fn drive_upload() {
-    if UPLOAD_BUSY.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let mut finished = false;
-    for _ in 0..8 {
-        let next = state::with_state(|state| {
-            let Some(upload) = state.upload.as_mut() else {
-                return None;
-            };
-            if !upload.started || upload.offset >= upload.data.len() {
-                return None;
-            }
-            let offset = upload.offset;
-            let end = (offset + CHUNK).min(upload.data.len());
-            let chunk = upload.data[offset..end].to_vec();
-            upload.crc = crc32(&chunk, upload.crc);
-            upload.offset = end;
-            let req = next_req();
-            Some((req, offset as u32, chunk, upload.offset >= upload.data.len()))
+    if UPLOAD_BUSY.swap(true, Ordering::SeqCst){return;}
+    let expired=state::with_state(|s|s.upload.as_ref().is_some_and(|u|u.started&&u.last_ack.elapsed().as_secs()>=15));
+    if expired{UPLOAD_BUSY.store(false,Ordering::SeqCst);cancel_upload_with("上传等待应答超时，临时文件已取消。".into()).await;return;}
+    for _ in 0..WINDOW {
+        let next=state::with_state(|s|{
+            let chunk=s.chunk;let u=s.upload.as_mut()?;
+            if !u.started||u.committing||u.offset>=u.data.len()||u.inflight.len()>=WINDOW{return None;}
+            let offset=u.offset;let end=(offset+chunk).min(u.data.len());let data=u.data[offset..end].to_vec();
+            let req=next_req();u.crc=crc32(&data,u.crc);u.offset=end;u.inflight.insert(req,(offset as u32,data.len()));
+            Some((req,offset as u32,data))
         });
-        let Some((req, offset, chunk, done)) = next else {
-            let done = state::with_state(|state| {
-                state.upload.as_ref().is_some_and(|upload| {
-                    upload.started && upload.offset >= upload.data.len()
-                })
-            });
-            if done {
-                finished = true;
-            }
-            break;
-        };
-        let mut payload = Vec::with_capacity(4 + chunk.len());
-        put_u32(&mut payload, offset);
-        payload.extend_from_slice(&chunk);
-        if let Err(error) = send_req(OP_WRITE, req, &payload).await {
-            UPLOAD_BUSY.store(false, Ordering::SeqCst);
-            cancel_upload_with(format!("上传中断：{error}")).await;
-            return;
-        }
-        if done {
-            finished = true;
-            break;
+        let Some((req,offset,data))=next else{break;};
+        let mut payload=Vec::with_capacity(4+data.len());put_u32(&mut payload,offset);payload.extend_from_slice(&data);
+        if let Err(e)=send_req(OP_WRITE,req,&payload).await{
+            UPLOAD_BUSY.store(false,Ordering::SeqCst);cancel_upload_with(format!("上传中断：{e}")).await;return;
         }
     }
-    if finished {
-        if let Some(timer_id) = UPLOAD_TIMER.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            timer::clear_timer(timer_id);
-        }
-        let (crc, target) = state::with_state(|state| {
-            state.upload.as_ref().map(|upload| (upload.crc ^ 0xFFFF_FFFF, upload.target.clone()))
-        })
-        .unwrap_or((0, String::new()));
-        let mut payload = Vec::new();
-        put_u32(&mut payload, crc);
-        if let Err(error) = request(OP_COMMIT, &payload, Pending::Commit).await {
-            state::with_state(|state| state.upload = None);
-            state::set_status(format!("提交上传失败：{error}"), true);
-        }
+    let commit=state::with_state(|s|{
+        let u=s.upload.as_mut()?;
+        if !u.ready_commit(){return None;}
+        u.committing=true;Some(u.crc^0xffffffff)
+    });
+    if let Some(crc)=commit{
+        if let Some(id)=UPLOAD_TIMER.lock().unwrap_or_else(|e|e.into_inner()).take(){timer::clear_timer(id);}
+        let mut payload=Vec::new();put_u32(&mut payload,crc);
+        if let Err(e)=request(OP_COMMIT,&payload,Pending::Commit).await{state::with_state(|s|s.upload=None);state::set_status(format!("提交上传失败：{e}"),true);}
     }
-    UPLOAD_BUSY.store(false, Ordering::SeqCst);
-    rerender();
+    UPLOAD_BUSY.store(false,Ordering::SeqCst);
+    state::with_state(|s|{if let Some(u)=&s.upload{if let Some(clock)=u.clock{s.speed=speed_text(u.reported,clock);}}});
+    rerender_progress();
 }
 
 async fn cancel_upload_with(message: String) {
@@ -772,6 +804,7 @@ async fn start_download() {
             inflight: HashMap::new(),
             written: 0,
             closing: false,
+            clock: Instant::now(), last_ack: Instant::now(),
         });
         state.status = format!("准备下载 {}…", detail.name);
         state.status_error = false;
@@ -826,11 +859,11 @@ async fn fill_read_window() {
             if download.closing || download.next_issue >= download.size {
                 return None;
             }
-            if download.inflight.len() >= 4 {
+            if download.inflight.len() >= WINDOW {
                 return None;
             }
             let offset = download.next_issue;
-            let len = CHUNK.min((download.size - offset) as usize) as u16;
+            let len = state.chunk.min((download.size - offset) as usize) as u16;
             download.next_issue += len as u32;
             let req = next_req();
             download.inflight.insert(req, offset);
@@ -871,7 +904,7 @@ async fn finish_download() {
             Err(error) => state::set_status(format!("保存本地文件失败：{error}"), true),
         }
     }
-    state::with_state(|state| state.download = None);
+    state::with_state(|s|{if let Some(d)=&s.download{s.speed=speed_text(d.written,d.clock);}s.download=None;});
     rerender();
 }
 
@@ -881,11 +914,14 @@ async fn on_read_response(status: u8, payload: &[u8], offset: u32) {
         cancel_download().await;
         return;
     }
+    let valid=state::with_state(|s|s.download.as_ref().is_some_and(|d|offset<d.size&&payload.len()==s.chunk.min((d.size-offset)as usize)));
+    if !valid{state::set_status("下载块长度不符合协商结果，已取消。",true);cancel_download().await;return;}
     let chunk = payload.to_vec();
     let (session, chunks, done) = state::with_state(|state| {
         let Some(download) = state.download.as_mut() else {
             return (0, Vec::new(), true);
         };
+        download.last_ack=Instant::now();
         download.received.insert(offset, chunk);
         let mut chunks = Vec::new();
         while let Some(data) = download.received.remove(&download.next_write) {
@@ -910,7 +946,8 @@ async fn on_read_response(status: u8, payload: &[u8], offset: u32) {
         return;
     }
     fill_read_window().await;
-    rerender();
+    state::with_state(|s|{if let Some(d)=&s.download{s.speed=speed_text(d.written,d.clock);}});
+    rerender_progress();
 }
 
 async fn handle_ui_event(event_id: &str, payload: &str) {
@@ -924,6 +961,9 @@ async fn handle_ui_event(event_id: &str, payload: &str) {
         return;
     }
     if event_id == EVENT_DEVICE {
+        if state::with_state(|s|s.busy||s.upload.is_some()||s.download.is_some()){
+            state::set_status("请先取消或完成当前传输，再切换设备。",true);rerender();return;
+        }
         let value = event_value(payload);
         if !value.is_empty() {
             state::with_state(|state| {
@@ -933,7 +973,7 @@ async fn handle_ui_event(event_id: &str, payload: &str) {
                 state.total = 0;
                 state.detail = None;
             });
-            connect_module().await;
+            connect_bridge().await;
         }
         return;
     }
@@ -942,11 +982,11 @@ async fn handle_ui_event(event_id: &str, payload: &str) {
         return;
     }
     if event_id == "action:connect" {
-        connect_module().await;
+        connect_bridge().await;
         return;
     }
     if event_id == "action:reconnect" {
-        reconnect_module().await;
+        reconnect_bridge().await;
         return;
     }
     if event_id == "action:refresh" {
@@ -958,6 +998,8 @@ async fn handle_ui_event(event_id: &str, payload: &str) {
         load_dir(path).await;
         return;
     }
+    if event_id=="action:benchmark"{start_benchmark().await;return;}
+    if event_id=="action:cancel-benchmark"{end_benchmark(Some("已取消测速。".into()));return;}
     if event_id == "action:upload" {
         start_upload().await;
         return;
@@ -982,7 +1024,7 @@ async fn handle_ui_event(event_id: &str, payload: &str) {
         if enabled {
             if dialog_confirm(
                 "关闭开发者模式",
-                "关闭后将只能写 /data（/data/canopus 除外）。",
+                "关闭后将只能写 /data。",
                 "关闭",
             )
             .await
@@ -991,7 +1033,7 @@ async fn handle_ui_event(event_id: &str, payload: &str) {
             }
         } else if dialog_confirm(
             "开启开发者模式",
-            "开启后可写入 /data 以外的路径（/dev、/proc、/sys、/data/canopus 仍被拒绝）。这会显著增加误删系统文件的风险，只在明确知道要做什么时使用。",
+            "开启后可写入 /data 以外的路径（/dev、/proc、/sys 仍被拒绝）。这会显著增加误删系统文件的风险，只在明确知道要做什么时使用。",
             "开启",
         )
         .await
@@ -1143,10 +1185,10 @@ async fn handle_ui_event(event_id: &str, payload: &str) {
 }
 
 async fn handle_hello(response: &Response<'_>) {
-    if response.status != ST_OK || response.payload.len() < 6 {
+    if response.status != ST_OK || response.payload.len() < 11 {
         state::with_state(|state| {
             state.busy = false;
-            state.status = format!("模块握手失败：{}", status_text(response.status));
+            state.status = format!("ChaosConnect握手失败：{}", status_text(response.status));
             state.status_error = true;
         });
         rerender();
@@ -1154,19 +1196,21 @@ async fn handle_hello(response: &Response<'_>) {
     }
     let version = response.payload[0];
     let dev = response.payload[4] != 0;
+    let chunk=get_u16(response.payload,1).unwrap_or(0) as usize;
+    if version!=PROTO_VERSION||chunk==0||chunk>CHUNK||get_u32(response.payload,7)!=Some(WINDOW as u32){
+        state::with_state(|s|{s.busy=false;s.connected=false;});
+        state::set_status("ChaosConnect版本或协商块大小不兼容，请同时更新插件和Chaos。",true);rerender();return;
+    }
     state::with_state(|state| {
         state.connected = true;
+        state.chunk=chunk;
         state.busy = false;
         state.dev_mode = dev;
-        state.status = format!("已连接 band_files（协议 v{version}）");
+        state.status = format!("已连接 ChaosConnect v{version} · {chunk} B × {WINDOW}窗口");
         state.status_error = false;
     });
-    if version != PROTO_VERSION {
-        state::set_status(
-            format!("模块协议 v{version} 与插件 v{PROTO_VERSION} 不一致，请一起更新。"),
-            true,
-        );
-    }
+    {let mut timer=WATCHDOG_TIMER.lock().unwrap_or_else(|e|e.into_inner());
+     if timer.is_none(){let id=timer::set_interval(1000,"transfer-watchdog");if id!=0{*timer=Some(id);}}}
     load_dir("/data".to_string()).await;
 }
 
@@ -1227,7 +1271,7 @@ async fn handle_list(pending: Pending, response: &Response<'_>) {
     else {
         state::with_state(|state| {
             state.loading = false;
-            state.status = "模块返回了无法解析的目录数据".to_string();
+            state.status = "文件桥返回了无法解析的目录数据".to_string();
             state.status_error = true;
         });
         rerender();
@@ -1343,6 +1387,7 @@ async fn handle_upload_open(response: &Response<'_>) {
         state::with_state(|state| {
             if let Some(upload) = state.upload.as_mut() {
                 upload.started = true;
+                upload.clock=Some(Instant::now());upload.last_ack=Instant::now();
                 upload.timer = Some(timer_id);
             }
             state.status = "上传中…".to_string();
@@ -1389,6 +1434,7 @@ async fn handle_commit(response: &Response<'_>) {
                 .unwrap_or_default()
         });
         state::with_state(|state| {
+            if let Some(u)=&state.upload{if let Some(clock)=u.clock{state.speed=speed_text(u.data.len() as u32,clock);}}
             state.upload = None;
             if state.preview.as_ref().is_some_and(|p| p.path == target) {
                 state.preview = None;
@@ -1505,6 +1551,7 @@ async fn handle_download_open(pending: Pending, response: &Response<'_>) {
             download.next_issue = 0;
             download.next_write = 0;
             download.written = 0;
+            download.clock=Instant::now();download.last_ack=Instant::now();
         }
         state.status = "下载中…".to_string();
         state.status_error = false;
@@ -1541,7 +1588,7 @@ async fn handle_set_dev(pending: Pending, response: &Response<'_>) {
     rerender();
 }
 
-impl event::Guest for BandFilesPlugin {
+impl event::Guest for ChaosConnectPlugin {
     async fn on_event(event_type: EventType, event_payload: String) -> String {
         match event_type {
             EventType::DeviceAction => {
@@ -1549,8 +1596,13 @@ impl event::Guest for BandFilesPlugin {
             }
             EventType::Timer => {
                 let timer_name = timer_payload(&event_payload);
-                if timer_name == "upload" {
+                if timer_name=="benchmark"{drive_benchmark().await;} else if timer_name == "upload" {
                     drive_upload().await;
+                } else if timer_name=="transfer-watchdog"{
+                    let upload_expired=state::with_state(|s|s.upload.as_ref().is_some_and(|u|u.last_ack.elapsed().as_secs()>=15));
+                    if upload_expired{cancel_upload_with("等待上传或提交应答超时，请刷新目录核对结果。".into()).await;}
+                    let expired=state::with_state(|s|s.download.as_ref().is_some_and(|d|d.last_ack.elapsed().as_secs()>=15));
+                    if expired{cancel_download().await;state::set_status("下载等待设备应答超时，已取消。",true);rerender();}
                 } else if timer_name == "hello-timeout" {
                     let pending = state::with_state(|state| {
                         if matches!(state.pending, Some(Pending::Hello)) {
@@ -1563,18 +1615,18 @@ impl event::Guest for BandFilesPlugin {
                     });
                     if pending {
                         state::set_status(
-                            "模块没有响应。请确认 Chaos 文件桥已启动，然后点“连接模块”。",
+                            "设备没有响应。请确认Chaos文件桥已开启，且AstroBox版本支持通用设备传输。",
                             true,
                         );
                         rerender();
                     }
                 }
             }
+            EventType::TransportPacket => receive_packet(&event_payload).await,
             EventType::PluginMessage
             | EventType::InterconnectMessage
             | EventType::ProviderAction
-            | EventType::DeeplinkAction
-            | EventType::TransportPacket => {}
+            | EventType::DeeplinkAction => {}
         }
         String::new()
     }
@@ -1592,30 +1644,46 @@ impl event::Guest for BandFilesPlugin {
     async fn on_card_render(_card_id: String) {}
 }
 
-impl plugin_connect::Guest for BandFilesPlugin {
-    async fn on_message(device_addr: String, module: String, payload: Payload) {
-        if module != MODULE_ID {
+async fn receive_packet(encoded:&str){
+    let Ok(packet)=base64::engine::general_purpose::STANDARD.decode(encoded)else{return;};
+    {let mut q=RECEIVE_QUEUE.lock().unwrap_or_else(|e|e.into_inner());
+     if q.len()>=WINDOW*4 {state::set_status("设备应答队列溢出，请重新连接。",true);return;}
+     q.push_back(packet);if RECEIVE_BUSY.swap(true,Ordering::SeqCst){return;}}
+    loop{
+        let next={let mut q=RECEIVE_QUEUE.lock().unwrap_or_else(|e|e.into_inner());
+            let next=q.pop_front();if next.is_none(){RECEIVE_BUSY.store(false,Ordering::SeqCst);}next};
+        let Some(packet)=next else{break;};receive_frame(&packet).await;
+    }
+}
+async fn receive_frame(packet:&[u8]){
+    let Some((frame,id))=unwrap_packet(packet)else{return;};
+    if id&0xffff0000!=PREFIX.load(Ordering::SeqCst){return;}
+        if let Some((2,r))=parse_frame(frame){
+            if r.op==EVENT_WRITE_PROGRESS {if let Some(done)=get_u32(r.payload,0){state::with_state(|s|{if let Some(u)=s.upload.as_mut(){u.reported=u.reported.max(done);}});}}
             return;
         }
-        let Payload::Binary(frame) = payload else {
+        let Some(response) = parse_response(frame) else {
             return;
         };
-        if frame.first() == Some(&EVENT_WRITE_PROGRESS) {
-            if let (Some(done), Some(_crc)) = (get_u32(&frame, 1), get_u32(&frame, 5)) {
-                state::with_state(|state| {
-                    if let Some(upload) = state.upload.as_mut() {
-                        upload.reported = done;
-                    }
-                });
-            }
-            return;
+        if response.op==0x31{
+            let chunk=state::with_state(|s|s.benchmark.as_mut().and_then(|b|b.inflight.remove(&response.req)));
+            if let Some((offset,n))=chunk{
+                if response.status!=ST_OK||response.payload.len()!=n||response.payload.iter().enumerate().any(|(i,v)|*v!=((offset as usize+i)*31)as u8){end_benchmark(Some("测速数据校验失败。".into()));return;}
+                let done=state::with_state(|s|{let Some(b)=s.benchmark.as_mut()else{return false;};b.received+=n as u32;b.last_ack=Instant::now();b.received==BENCH_BYTES&&b.inflight.is_empty()});
+                if done{end_benchmark(None);}else{drive_benchmark().await;}
+            }return;
         }
-        let Some(response) = parse_response(&frame) else {
-            return;
-        };
-        let selected = state::selected_addr();
-        if !selected.is_empty() && selected != device_addr {
-            return;
+        if response.op==OP_WRITE {
+            let accepted=state::with_state(|s|{let Some(u)=s.upload.as_mut()else{return Ok(false);};
+                if !u.inflight.contains_key(&response.req){return Ok(false);}
+                if response.status!=ST_OK{return Err(());}
+                u.acknowledge(response.req,get_u32(response.payload,0).ok_or(())?)
+            });
+            match accepted{
+                Err(())=>{cancel_upload_with(format!("上传确认失败：{}",status_text(response.status))).await;return;}
+                Ok(true)=>drive_upload().await,
+                Ok(false)=>{}
+            }return;
         }
         // Reads have their own in-flight map and no single pending slot.
         let read_offset = state::with_state(|state| {
@@ -1643,20 +1711,19 @@ impl plugin_connect::Guest for BandFilesPlugin {
             Pending::PreviewOpen { .. } => handle_preview_open(pending, &response).await,
             Pending::PreviewRead { .. } => handle_preview_read(pending, &response).await,
         }
-    }
 }
 
-impl lifecycle::Guest for BandFilesPlugin {
+impl lifecycle::Guest for ChaosConnectPlugin {
     async fn on_load() {
         refresh_devices().await;
         let addr = state::selected_addr();
         if !addr.is_empty() {
-            connect_module().await;
+            connect_bridge().await;
         }
     }
 }
 
-export!(BandFilesPlugin);
+export!(ChaosConnectPlugin);
 
 #[cfg(test)]
 mod tests {

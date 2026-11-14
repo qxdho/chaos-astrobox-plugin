@@ -1,6 +1,9 @@
-//! Binary protocol shared with the Canopus `band_files` module.
+//! ChaosConnect v1: private CRC-protected frames over the authenticated device transport.
 
-pub const MODULE_ID: &str = "band_files";
+pub const PB_TYPE: u32 = 0x4343;
+pub const HEADER: usize = 16;
+pub const WINDOW: usize = 8;
+pub const MAX_PAYLOAD: usize = CHUNK + 256;
 pub const PROTO_VERSION: u8 = 1;
 
 pub const OP_HELLO: u8 = 0x01;
@@ -39,7 +42,7 @@ pub const ST_SEQUENCE: u8 = 11;
 pub const ST_UNSUPPORTED: u8 = 12;
 pub const ST_TOO_LARGE: u8 = 13;
 
-pub const CHUNK: usize = 448;
+pub const CHUNK: usize = 2048;
 
 pub fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -61,9 +64,9 @@ pub fn get_u32(data: &[u8], off: usize) -> Option<u32> {
 
 pub fn push_str(out: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
-    let len = bytes.len().min(255) as u16;
+    let len = u16::try_from(bytes.len()).unwrap_or(0);
     put_u16(out, len);
-    out.extend_from_slice(&bytes[..len as usize]);
+    out.extend_from_slice(bytes);
 }
 
 pub fn read_str(data: &[u8], off: usize) -> Option<(String, usize)> {
@@ -73,35 +76,44 @@ pub fn read_str(data: &[u8], off: usize) -> Option<(String, usize)> {
     Some((String::from_utf8_lossy(bytes).into_owned(), start + len))
 }
 
-pub fn encode_request(op: u8, req: u16, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(3 + payload.len());
-    out.push(op);
-    put_u16(&mut out, req);
-    out.extend_from_slice(payload);
-    out
+pub fn encode_frame(flags:u8,op:u8,status:u8,req:u16,payload:&[u8])->Vec<u8>{
+    assert!(payload.len()<=MAX_PAYLOAD);
+    let mut out=Vec::with_capacity(HEADER+payload.len());
+    out.extend_from_slice(b"CCN1");out.extend_from_slice(&[PROTO_VERSION,flags,op,status]);
+    put_u16(&mut out,req);put_u16(&mut out,payload.len() as u16);put_u32(&mut out,0);out.extend_from_slice(payload);
+    let crc=crc32(payload,crc32(&out[..12],0xffffffff))^0xffffffff;
+    out[12..16].copy_from_slice(&crc.to_le_bytes());out
 }
-
-pub struct Response<'a> {
-    pub op: u8,
-    pub req: u16,
-    pub status: u8,
-    pub payload: &'a [u8],
+pub fn encode_request(op:u8,req:u16,payload:&[u8])->Vec<u8>{encode_frame(0,op,0,req,payload)}
+pub struct Response<'a>{pub op:u8,pub req:u16,pub status:u8,pub payload:&'a [u8]}
+pub fn parse_frame(frame:&[u8])->Option<(u8,Response<'_>)>{
+    if frame.len()<HEADER||frame.get(..4)?!=b"CCN1"||frame[4]!=PROTO_VERSION||frame[5]>2||frame.len()!=HEADER+get_u16(frame,10)? as usize||frame.len()>HEADER+MAX_PAYLOAD{return None;}
+    if get_u32(frame,12)?!=(crc32(&frame[HEADER..],crc32(&frame[..12],0xffffffff))^0xffffffff){return None;}
+    Some((frame[5],Response{op:frame[6],req:get_u16(frame,8)?,status:frame[7],payload:&frame[HEADER..]}))
 }
-
-pub fn parse_response(frame: &[u8]) -> Option<Response<'_>> {
-    if frame.len() < 4 {
-        return None;
-    }
-    let op = frame[0];
-    if op & 0x80 == 0 {
-        return None;
-    }
-    Some(Response {
-        op: op & 0x7F,
-        req: u16::from_le_bytes([frame[1], frame[2]]),
-        status: frame[3],
-        payload: &frame[4..],
-    })
+pub fn parse_response(frame:&[u8])->Option<Response<'_>>{let(flags,r)=parse_frame(frame)?;(flags==1).then_some(r)}
+fn varint(out:&mut Vec<u8>,mut value:u32){while value>=128{out.push((value as u8&127)|128);value>>=7;}out.push(value as u8);}
+fn bytes_field(out:&mut Vec<u8>,field:u32,value:&[u8]){varint(out,field<<3|2);varint(out,value.len() as u32);out.extend_from_slice(value);}
+/// Known MessageContent bytes fields survive the host's prost decode/re-encode.
+/// The outer type is private, so no stock application opcode is being invoked.
+pub fn wrap_packet(frame:&[u8],id:u32)->Vec<u8>{
+    let mut basic=Vec::new();bytes_field(&mut basic,1,b"ChaosConnect");bytes_field(&mut basic,2,&[]);
+    let mut message=Vec::new();bytes_field(&mut message,1,&basic);bytes_field(&mut message,2,frame);
+    let mut app=Vec::new();bytes_field(&mut app,9,&message);
+    let mut out=Vec::new();varint(&mut out,8);varint(&mut out,PB_TYPE);varint(&mut out,16);varint(&mut out,id);bytes_field(&mut out,22,&app);out
+}
+fn read_var(p:&[u8],at:&mut usize)->Option<u32>{let mut v=0;for shift in (0..35).step_by(7){let b=*p.get(*at)?;*at+=1;if shift==28&&b&0xf0!=0{return None;}v|=((b&127) as u32)<<shift;if b&128==0{return Some(v);}}None}
+fn field(p:&[u8],wanted:u32,wire:u32)->Option<(&[u8],u32)>{
+    let mut at=0;let mut found=None;
+    while at<p.len(){let tag=read_var(p,&mut at)?;if tag<8{return None;}
+        let (data,value)=match tag&7{0=>( &p[0..0],read_var(p,&mut at)?),2=>{let n=read_var(p,&mut at)? as usize;let end=at.checked_add(n)?;let data=p.get(at..end)?;at=end;(data,n as u32)},1|5=>{at=at.checked_add(if tag&7==1{8}else{4})?;p.get(..at)?;(&p[0..0],0)},_=>return None};
+        if tag>>3==wanted{if found.is_some()||tag&7!=wire{return None;}found=Some((data,value));}
+    }found
+}
+pub fn unwrap_packet(p:&[u8])->Option<(&[u8],u32)>{
+    if field(p,1,0)?.1!=PB_TYPE{return None;}let id=field(p,2,0)?.1;
+    let app=field(p,22,2)?.0;let message=field(app,9,2)?.0;let basic=field(message,1,2)?.0;
+    if field(basic,1,2)?.0!=b"ChaosConnect"{return None;}let frame=field(message,2,2)?.0;let(_,r)=parse_frame(frame)?;if r.req as u32!=id&0xffff{return None;}Some((frame,id))
 }
 
 pub fn status_text(status: u8) -> &'static str {
@@ -118,7 +130,7 @@ pub fn status_text(status: u8) -> &'static str {
         ST_IO => "文件系统读写失败",
         ST_CRC => "校验失败，文件未写入",
         ST_SEQUENCE => "传输顺序错误",
-        ST_UNSUPPORTED => "当前模块/固件不支持该操作",
+        ST_UNSUPPORTED => "当前文件桥/固件不支持该操作",
         ST_TOO_LARGE => "文件大小超出限制",
         _ => "未知错误",
     }
@@ -208,8 +220,9 @@ mod tests {
     #[test]
     fn frame_roundtrip() {
         let frame = encode_request(OP_LIST, 0x1234, &[1, 2, 3]);
-        assert_eq!(frame, vec![OP_LIST, 0x34, 0x12, 1, 2, 3]);
-        let response = [OP_LIST | 0x80, 0x34, 0x12, ST_OK, 9, 8];
+        assert_eq!(&frame[..4], b"CCN1");
+        assert_eq!(&frame[HEADER..], &[1,2,3]);
+        let response = encode_frame(1, OP_LIST, ST_OK, 0x1234, &[9,8]);
         let parsed = parse_response(&response).unwrap();
         assert_eq!(parsed.op, OP_LIST);
         assert_eq!(parsed.req, 0x1234);
@@ -236,5 +249,61 @@ mod tests {
     fn time_formatting() {
         assert_eq!(format_time(0), "-");
         assert_eq!(format_time(1_700_000_000), "2023-11-14 22:13");
+    }
+}
+
+#[cfg(test)] mod connect_tests{
+ use super::*;
+ #[test] fn rejects_corruption_duplicates_and_truncation(){
+  let f=encode_frame(1,OP_READ,0,7,&vec![19;CHUNK]);let p=wrap_packet(&f,0x56780007);
+  assert_eq!(unwrap_packet(&p).unwrap(),(f.as_slice(),0x56780007));
+  for n in 0..f.len(){assert!(parse_frame(&f[..n]).is_none());}
+  for n in [0,4,5,7,8,10,12,16,f.len()-1]{let mut damaged=f.clone();damaged[n]^=1;assert!(parse_frame(&damaged).is_none());}
+  let mut duplicate=p.clone();duplicate.extend_from_slice(&[8,0xc3,0x86,1]);assert!(unwrap_packet(&duplicate).is_none());
+ }
+}
+
+#[cfg(test)] mod host_roundtrip_tests {
+    use super::*;
+    use prost::Message;
+    // The exact known fields used by the official host WearPacket schema.
+    // This catches protobuf unknown-field loss before anything is sent to a watch.
+    #[derive(Clone,PartialEq,Message)] struct Basic{
+        #[prost(string,required,tag="1")] name:String,
+        #[prost(bytes="vec",required,tag="2")] fingerprint:Vec<u8>,
+    }
+    #[derive(Clone,PartialEq,Message)] struct Content{
+        #[prost(message,required,tag="1")] basic:Basic,
+        #[prost(bytes="vec",required,tag="2")] content:Vec<u8>,
+    }
+    #[derive(Clone,PartialEq,Message)] struct App{
+        #[prost(message,optional,tag="9")] content:Option<Content>,
+    }
+    #[derive(Clone,Copy,Debug,PartialEq,Eq,prost::Enumeration)] #[repr(i32)] enum Kind{Other=0,System=2}
+    #[derive(Clone,PartialEq,Message)] struct Packet{
+        #[prost(enumeration="Kind",required,tag="1")] kind:i32,
+        #[prost(uint32,required,tag="2")] id:u32,
+        #[prost(message,optional,tag="22")] app:Option<App>,
+    }
+    #[test] fn actual_prost_reencode_keeps_private_type_and_binary_payload(){
+        for n in [0,1,127,128,CHUNK,MAX_PAYLOAD]{
+            let data=(0..n).map(|i|i as u8).collect::<Vec<_>>();
+            let frame=encode_request(OP_WRITE,0x1234,&data);let packet=wrap_packet(&frame,0xabcd1234);
+            let decoded=Packet::decode(packet.as_slice()).unwrap();
+            assert_eq!(decoded.kind,PB_TYPE as i32);assert_eq!(decoded.id,0xabcd1234);
+            let encoded=decoded.encode_to_vec();assert_eq!(encoded,packet);
+            assert_eq!(unwrap_packet(&encoded).unwrap(),(frame.as_slice(),0xabcd1234));
+        }
+    }
+}
+
+#[cfg(test)] mod wire_vectors {
+    use super::*;
+    #[test] fn shared_c_rust_wire_vector(){
+        let values=include_str!("../tests/CHAOSCONNECT-V1.hex").lines().map(|line|{
+            (0..line.len()).step_by(2).map(|i|u8::from_str_radix(&line[i..i+2],16).unwrap()).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        assert_eq!(encode_request(OP_HELLO,0x1234,&[]),values[0]);
+        assert_eq!(wrap_packet(&values[0],0x12341234),values[1]);
     }
 }
