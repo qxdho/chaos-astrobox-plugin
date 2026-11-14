@@ -78,7 +78,7 @@ pub fn build(state: &State) -> View {
 
     let busy = state.busy || state.transfer.is_some();
     let mut header = row()
-        .child(title("ChaosConnect", 22).grow())
+        .child(title("Chaos Connect", 22).grow())
         .child(badge(
             if state.connected { "已连接" } else { "未连接" },
             if state.connected { OK } else { MUTED },
@@ -100,7 +100,7 @@ pub fn build(state: &State) -> View {
     }
     if state.dev_authorization.is_some(){
         root=root.child(card().child(title("等待手环处理权限请求",17))
-            .child(muted("请点亮手环屏幕并确认；拒绝、断连或授权超时均不会开启。"))
+            .child(muted("请在手环授权弹窗中确认；拒绝、断连或授权超时均不会开启。"))
             .child(button("取消本次请求","action:cancel-authorization",false)));
     }
 

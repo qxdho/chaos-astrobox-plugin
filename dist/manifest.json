@@ -1,9 +1,9 @@
 {
-  "name": "ChaosConnect 文件管理器",
+  "name": "Chaos Connect",
   "icon": "icon.png",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "通过ChaosConnect私有协议管理Chaos设备文件，支持窗口传输、CRC校验及实际速度统计。",
-  "author": "Searchstars",
+  "author": "IKUN_CXKPRO",
   "website": "",
   "entry": "astrobox_plugin_chaos_connect.wasm",
   "wasi_version": 3,

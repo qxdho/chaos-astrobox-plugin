@@ -723,7 +723,7 @@ async fn drive_benchmark(){
 
 fn speed_text(bytes:u32,clock:Instant)->String {
     let rate=bytes as f64/clock.elapsed().as_secs_f64().max(0.001);
-    format!("{:.1} KB/s · {:.0} kb/s{}",rate/1000.0,rate*8.0/1000.0,if rate>=25000.0{" · 达到200 kb/s"}else{" · 未达到200 kb/s"})
+    format!("{:.1} KB/s · {:.0} kb/s",rate/1000.0,rate*8.0/1000.0)
 }
 async fn drive_upload() {
     if UPLOAD_BUSY.swap(true, Ordering::SeqCst){return;}
@@ -1638,7 +1638,7 @@ async fn apply_device_status(status:DeviceStatus){
             if token==0&&status.authorization==1&&status.token!=0{
                 s.dev_authorization=Some((status.token,Instant::now()));
                 s.pending=None;s.pending_req=0;
-                s.status="手环正在等待授权，请点亮屏幕并确认。".into();s.status_error=false;changed=true;return;
+                s.status="手环正在等待授权，请在手环弹窗中确认。".into();s.status_error=false;changed=true;return;
             }
             s.dev_authorization=None;s.busy=false;changed=true;
             let (message,error)=if token==0{
@@ -1667,7 +1667,7 @@ async fn handle_set_dev(pending: Pending, response: &Response<'_>) {
             state::with_state(|s|{s.busy=false;s.dev_authorization=None;});
             state::set_status("手环返回了无效授权编号，未开启开发者模式。",true);rerender();return;
         };
-        state::with_state(|s|{s.dev_authorization=Some((token,Instant::now()));s.status="请点亮手环屏幕，确认是否允许启用开发者模式（60秒内有效）。".into();s.status_error=false;});
+        state::with_state(|s|{s.dev_authorization=Some((token,Instant::now()));s.status="请在手环确认是否允许启用开发者模式（60秒内有效）。".into();s.status_error=false;});
         rerender();return;
     }
     state::with_state(|s|{s.busy=false;s.dev_authorization=None;});
@@ -1901,6 +1901,13 @@ mod tests {
         receive(&wrap_packet(&stopped,0x11220000));
         assert!(state::with_state(|s|!s.connected&&!s.dev_mode&&!s.busy&&s.dev_authorization.is_none()&&s.status.contains("停用")));
         PREFIX.store(0,Ordering::SeqCst);
+    }
+
+    #[test]
+    fn speed_label_contains_only_measured_rates() {
+        let label=speed_text(1024,Instant::now()-std::time::Duration::from_secs(1));
+        assert!(label.contains("KB/s")&&label.contains("kb/s"));
+        assert!(!label.contains("达到")&&!label.contains("200"));
     }
 
     #[test]
