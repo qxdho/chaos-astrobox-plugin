@@ -1,7 +1,7 @@
 {
   "name": "ChaosConnect 文件管理器",
   "icon": "icon.png",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "通过ChaosConnect私有协议管理Chaos设备文件，支持窗口传输、CRC校验及实际速度统计。",
   "author": "Searchstars",
   "website": "",

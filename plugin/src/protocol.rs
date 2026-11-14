@@ -28,6 +28,7 @@ pub const OP_SET_DEV: u8 = 0x40;
 pub const OP_GET_DEV: u8 = 0x41;
 
 pub const EVENT_WRITE_PROGRESS: u8 = 0xC1;
+pub const EVENT_DEVICE_STATE: u8 = 0xC2;
 
 pub const ST_OK: u8 = 0;
 pub const ST_BAD: u8 = 1;

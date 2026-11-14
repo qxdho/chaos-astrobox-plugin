@@ -1766,6 +1766,13 @@ async fn receive_frame(packet:&[u8]){
     let Some((frame,id))=unwrap_packet(packet)else{return;};
     if id&0xffff0000!=PREFIX.load(Ordering::SeqCst){return;}
         if let Some((2,r))=parse_frame(frame){
+            if r.op==EVENT_DEVICE_STATE&&r.req==0&&r.status==ST_OK{
+                if let Some(status)=parse_device_status(r.payload){
+                    if !status.connected{connection_lost("ChaosConnect已在手环停用，连接已断开。").await;}
+                    else{apply_device_status(status).await;}
+                }
+                return;
+            }
             if r.op==EVENT_WRITE_PROGRESS {if let Some(done)=get_u32(r.payload,0){state::with_state(|s|{if let Some(u)=s.upload.as_mut(){u.reported=u.reported.max(done);}});}}
             return;
         }
@@ -1874,6 +1881,26 @@ mod tests {
         state::with_state(|s|{s.dev_mode=true;s.dev_authorization=Some((19,Instant::now()));s.busy=true;});
         state::clear_connection();
         assert!(state::with_state(|s|!s.connected&&!s.dev_mode&&!s.busy&&s.dev_authorization.is_none()));
+
+        // Real receive path: only the matching session's valid stopped event
+        // tears down the visible connection, without waiting for a heartbeat.
+        fn receive(packet:&[u8]){
+            use std::future::Future;
+            use std::task::{Context,Poll,Waker};
+            let mut future=std::pin::pin!(receive_frame(packet));
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())),Poll::Ready(())));
+        }
+        PREFIX.store(0x11220000,Ordering::SeqCst);
+        state::with_state(|s|{*s=state::State::default();s.connected=true;s.dev_mode=true;s.busy=true;s.dev_authorization=Some((99,Instant::now()));});
+        let stopped=encode_frame(2,EVENT_DEVICE_STATE,ST_OK,0,&[0,0,2,0,0,0,0,0]);
+        receive(&wrap_packet(&stopped,0x33440000));
+        assert!(state::with_state(|s|s.connected));
+        let mut corrupt=stopped.clone();*corrupt.last_mut().unwrap()^=1;
+        receive(&wrap_packet(&corrupt,0x11220000));
+        assert!(state::with_state(|s|s.connected));
+        receive(&wrap_packet(&stopped,0x11220000));
+        assert!(state::with_state(|s|!s.connected&&!s.dev_mode&&!s.busy&&s.dev_authorization.is_none()&&s.status.contains("停用")));
+        PREFIX.store(0,Ordering::SeqCst);
     }
 
     #[test]
