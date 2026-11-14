@@ -1,0 +1,15 @@
+[package]
+name = "chaos-connect-host-pb-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+prost = "0.14"
+serde = "1"
+pbjson = "0.8"
+
+[build-dependencies]
+prost-build = "0.14"
+pbjson-build = "0.8"
+protoc-bin-vendored = "3.2"

@@ -178,7 +178,7 @@ impl Default for State {
             total: 0,
             page: 0,
             loading: false,
-            status: "请选择已连接的手环，并在 Chaos 设置中开启文件桥。".to_string(),
+            status: "请在 Chaos 设置中开启文件桥，再点击“刷新设备”和“连接ChaosConnect”。".to_string(),
             status_error: false,
             detail: None,
             pending: None,

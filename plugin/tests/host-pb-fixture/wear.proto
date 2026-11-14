@@ -1,0 +1,54 @@
+// Exact wire fields used by ChaosConnect, from the official host schema:
+// https://github.com/AstralSightStudios/AstroBox-NG-Module-Pb/blob/main/protos/xiaomi/wear.proto
+// https://github.com/AstralSightStudios/AstroBox-NG-Module-Pb/blob/main/protos/xiaomi/wear_thirdparty_app.proto
+// Unused payload variants are omitted; the Type enum is complete.
+syntax = "proto2";
+package protocol;
+
+message WearPacket {
+    enum Type {
+        OTHER = 0;
+        ACCOUNT = 1;
+        SYSTEM = 2;
+        WATCH_FACE = 4;
+        NFC = 5;
+        NOTIFICATION = 7;
+        FITNESS = 8;
+        LPA = 9;
+        WEATHER = 10;
+        STOCK = 11;
+        CALENDAR = 12;
+        FACTORY = 13;
+        AIVS = 14;
+        MARKET = 15;
+        GNSS = 16;
+        CLOCK = 17;
+        MEDIA = 18;
+        ALEXA = 19;
+        THIRDPARTY_APP = 20;
+        CONTACT = 21;
+        MASS = 22;
+        INTERCONNECTION = 23;
+    }
+    required Type type = 1;
+    required uint32 id = 2;
+    oneof payload {
+        ThirdpartyApp thirdparty_app = 22;
+    }
+}
+
+message ThirdpartyApp {
+    oneof payload {
+        MessageContent message_content = 9;
+    }
+}
+
+message BasicInfo {
+    required string package_name = 1;
+    required bytes fingerprint = 2;
+}
+
+message MessageContent {
+    required BasicInfo basic_info = 1;
+    required bytes content = 2;
+}

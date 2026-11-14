@@ -20,12 +20,16 @@ CRC32为标准IEEE多项式 `0xEDB88320`，初值和终值异或均为 `0xFFFFFF
 
 ## AstroBox承载
 
-使用v4官方 `transport.send(addr, bytes)`，并通过 `register_transport_recv(addr, {channel_id:1, protobuf_typeid:0x4343})` 订阅。权限字符串分别为 `request`、`register_transport_recv`，设备列表另需 `device`。
+使用v4官方 `transport.send(addr, bytes)`，并通过 `register_transport_recv(addr, {channel_id:1, protobuf_typeid:0})` 订阅。权限字符串分别为 `request`、`register_transport_recv`，设备列表另需 `device`。
+
+`protobuf_typeid=0` 在宿主订阅中表示通配，仍由 `channel_id=1` 限定PB通道；插件解包必须另外验证外层type恰为0、包名、CCN1、CRC、连接前缀和请求ID。普通PB会被忽略。宿主第三方消息组件还可能广播同一MessageContent，但不参与ChaosConnect应答处理。
+
+外层type必须是schema已定义枚举。旧0.2.0使用17219，虽能通过prost却在宿主pbjson日志序列化时失败并触发unwrap panic。0.2.1使用OTHER，不改变CCN1内部帧。插件启用阶段不查询设备或自动HELLO，手动刷新设备和连接后再订阅/发包。
 
 宿主对发送内容使用WearPacket解码再编码，必须使用已定义的字段保存二进制：
 
 ```text
-WearPacket.type (field 1) = 0x4343（私有）
+WearPacket.type (field 1) = OTHER (0，schema中已定义)
 WearPacket.id   (field 2) = connection_prefix:u16 << 16 | request_id:u16
 WearPacket.thirdparty_app (field 22)
   message_content (field 9)
@@ -35,7 +39,7 @@ WearPacket.thirdparty_app (field 22)
     content (field 2) = CCN1帧
 ```
 
-消息进入已认证的SARv2/L2 PB承载。设备只拦截私有type、namespace和正确帧；正常PB、其他L2通道（包括0x43）原样转交系统。**这不是独立L2CAP PSM或裸L2CAP socket协议**；蓝牙具体承载由宿主决定。官方最新宿主源码已实现通用设备传输，旧占位宿主不支持。
+消息进入已认证的SARv2/L2 PB承载。设备只拦截OTHER类型、ChaosConnect namespace和正确帧；正常PB、其他L2通道（包括0x43）原样转交系统。**这不是独立L2CAP PSM或裸L2CAP socket协议**；蓝牙具体承载由宿主决定。官方最新宿主源码已实现通用设备传输，旧占位宿主不支持。
 
 接收的 `transport-packet` event-payload是**直接的标准Base64字符串**，解码后为WearPacket。应答完整回显ID；事件使用当前连接前缀+低16位0。插件拒绝旧连接前缀和ID不匹配的帧。重新连接先换前缀再HELLO；设备的新HELLO清理原读写事务和开发者模式。
 

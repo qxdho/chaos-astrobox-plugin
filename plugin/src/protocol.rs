@@ -1,6 +1,8 @@
 //! ChaosConnect v1: private CRC-protected frames over the authenticated device transport.
 
-pub const PB_TYPE: u32 = 0x4343;
+// Unknown enum values survive prost but panic the host's pbjson trace logger.
+// OTHER is defined in WearPacket.Type; ChaosConnect/CCN1 identifies our traffic.
+pub const PB_TYPE: u32 = 0;
 pub const HEADER: usize = 16;
 pub const WINDOW: usize = 8;
 pub const MAX_PAYLOAD: usize = CHUNK + 256;
@@ -95,7 +97,7 @@ pub fn parse_response(frame:&[u8])->Option<Response<'_>>{let(flags,r)=parse_fram
 fn varint(out:&mut Vec<u8>,mut value:u32){while value>=128{out.push((value as u8&127)|128);value>>=7;}out.push(value as u8);}
 fn bytes_field(out:&mut Vec<u8>,field:u32,value:&[u8]){varint(out,field<<3|2);varint(out,value.len() as u32);out.extend_from_slice(value);}
 /// Known MessageContent bytes fields survive the host's prost decode/re-encode.
-/// The outer type is private, so no stock application opcode is being invoked.
+/// Use the defined OTHER enum; privacy is in the package name and CCN1 frame.
 pub fn wrap_packet(frame:&[u8],id:u32)->Vec<u8>{
     let mut basic=Vec::new();bytes_field(&mut basic,1,b"ChaosConnect");bytes_field(&mut basic,2,&[]);
     let mut message=Vec::new();bytes_field(&mut message,1,&basic);bytes_field(&mut message,2,frame);
@@ -266,31 +268,13 @@ mod tests {
 #[cfg(test)] mod host_roundtrip_tests {
     use super::*;
     use prost::Message;
-    // The exact known fields used by the official host WearPacket schema.
-    // This catches protobuf unknown-field loss before anything is sent to a watch.
-    #[derive(Clone,PartialEq,Message)] struct Basic{
-        #[prost(string,required,tag="1")] name:String,
-        #[prost(bytes="vec",required,tag="2")] fingerprint:Vec<u8>,
-    }
-    #[derive(Clone,PartialEq,Message)] struct Content{
-        #[prost(message,required,tag="1")] basic:Basic,
-        #[prost(bytes="vec",required,tag="2")] content:Vec<u8>,
-    }
-    #[derive(Clone,PartialEq,Message)] struct App{
-        #[prost(message,optional,tag="9")] content:Option<Content>,
-    }
-    #[derive(Clone,Copy,Debug,PartialEq,Eq,prost::Enumeration)] #[repr(i32)] enum Kind{Other=0,System=2}
-    #[derive(Clone,PartialEq,Message)] struct Packet{
-        #[prost(enumeration="Kind",required,tag="1")] kind:i32,
-        #[prost(uint32,required,tag="2")] id:u32,
-        #[prost(message,optional,tag="22")] app:Option<App>,
-    }
-    #[test] fn actual_prost_reencode_keeps_private_type_and_binary_payload(){
+    use chaos_connect_host_pb_fixture::protocol::WearPacket;
+    #[test] fn host_prost_reencode_keeps_known_type_and_binary_payload(){
         for n in [0,1,127,128,CHUNK,MAX_PAYLOAD]{
             let data=(0..n).map(|i|i as u8).collect::<Vec<_>>();
             let frame=encode_request(OP_WRITE,0x1234,&data);let packet=wrap_packet(&frame,0xabcd1234);
-            let decoded=Packet::decode(packet.as_slice()).unwrap();
-            assert_eq!(decoded.kind,PB_TYPE as i32);assert_eq!(decoded.id,0xabcd1234);
+            let decoded=WearPacket::decode(packet.as_slice()).unwrap();
+            assert_eq!(decoded.r#type,PB_TYPE as i32);assert_eq!(decoded.id,0xabcd1234);
             let encoded=decoded.encode_to_vec();assert_eq!(encoded,packet);
             assert_eq!(unwrap_packet(&encoded).unwrap(),(frame.as_slice(),0xabcd1234));
         }
@@ -305,5 +289,58 @@ mod tests {
         }).collect::<Vec<_>>();
         assert_eq!(encode_request(OP_HELLO,0x1234,&[]),values[0]);
         assert_eq!(wrap_packet(&values[0],0x12341234),values[1]);
+    }
+}
+
+#[cfg(test)]
+mod host_log_tests {
+    use super::*;
+    use chaos_connect_host_pb_fixture::protocol::{WearPacket, wear_packet};
+    use prost::Message;
+
+    #[test]
+    fn old_private_enum_reproduces_host_json_log_failure() {
+        let wire = wrap_packet(&encode_request(OP_HELLO, 1, &[]), 0x12340001);
+        let mut packet = WearPacket::decode(wire.as_slice()).unwrap();
+        packet.r#type = 0x4343;
+        // Prost alone accepts it; pbjson (used by the host trace logger) does not.
+        let packet = WearPacket::decode(packet.encode_to_vec().as_slice()).unwrap();
+        let error = serde_json::to_string(&packet).unwrap_err().to_string();
+        assert!(error.contains("Invalid variant 17219"), "{error}");
+    }
+
+    #[test]
+    fn hello_and_data_survive_host_binary_and_json_logging() {
+        assert_eq!(PB_TYPE, wear_packet::Type::Other as u32);
+        for (flags, op, n) in [(0, OP_HELLO, 0), (1, OP_HELLO, 11),
+                              (0, OP_WRITE, CHUNK + 4), (1, OP_READ, CHUNK),
+                              (2, EVENT_WRITE_PROGRESS, 8), (0, OP_WRITE, MAX_PAYLOAD)] {
+            let data = (0..n).map(|i| i as u8).collect::<Vec<_>>();
+            let frame = encode_frame(flags, op, ST_OK, 0x1234, &data);
+            let wire = wrap_packet(&frame, 0xabcd1234);
+            let decoded = WearPacket::decode(wire.as_slice()).unwrap();
+            let log_json = serde_json::to_string(&decoded).unwrap();
+            let restored: WearPacket = serde_json::from_str(&log_json).unwrap();
+            for packet in [decoded, restored] {
+                let encoded = packet.encode_to_vec();
+                assert_eq!(encoded, wire);
+                assert_eq!(unwrap_packet(&encoded).unwrap(), (frame.as_slice(), 0xabcd1234));
+            }
+        }
+    }
+
+    #[test]
+    fn other_type_still_requires_our_namespace_frame_and_request_id() {
+        let frame = encode_request(OP_HELLO, 7, &[]);
+        let wire = wrap_packet(&frame, 0x12340007);
+        let mut other_app = wire.clone();
+        let name_at = other_app.windows(12).position(|v| v == b"ChaosConnect").unwrap();
+        other_app[name_at] = b'X';
+        assert!(unwrap_packet(&other_app).is_none());
+        assert!(unwrap_packet(&wrap_packet(&frame, 0x12340008)).is_none());
+        assert!(unwrap_packet(&[8, 0, 16, 0]).is_none());
+        let mut corrupted = wire;
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(unwrap_packet(&corrupted).is_none());
     }
 }

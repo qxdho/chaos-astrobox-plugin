@@ -29,6 +29,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+static DEVICES_REQUESTED: AtomicBool = AtomicBool::new(false);
 static NEXT_REQ: AtomicU16 = AtomicU16::new(1);
 static PREFIX: AtomicU32 = AtomicU32::new(0);
 static UPLOAD_BUSY: AtomicBool = AtomicBool::new(false);
@@ -102,6 +103,7 @@ async fn request(op: u8, payload: &[u8], pending: Pending) -> Result<(), String>
 }
 
 async fn refresh_devices() {
+    DEVICES_REQUESTED.store(true, Ordering::SeqCst);
     let devices = device::get_connected_device_list()
         .await
         .into_iter()
@@ -1592,7 +1594,10 @@ impl event::Guest for ChaosConnectPlugin {
     async fn on_event(event_type: EventType, event_payload: String) -> String {
         match event_type {
             EventType::DeviceAction => {
-                refresh_devices().await;
+                // Start host device access only after the user first requests it.
+                if DEVICES_REQUESTED.load(Ordering::SeqCst) {
+                    refresh_devices().await;
+                }
             }
             EventType::Timer => {
                 let timer_name = timer_payload(&event_payload);
@@ -1715,11 +1720,8 @@ async fn receive_frame(packet:&[u8]){
 
 impl lifecycle::Guest for ChaosConnectPlugin {
     async fn on_load() {
-        refresh_devices().await;
-        let addr = state::selected_addr();
-        if !addr.is_empty() {
-            connect_bridge().await;
-        }
+        // Report readiness without device/transport calls. Discovery and HELLO
+        // start from the UI after the runtime is fully enabled.
     }
 }
 
@@ -1728,6 +1730,15 @@ export!(ChaosConnectPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_finishes_without_calling_device_or_transport_imports() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let mut startup = std::pin::pin!(<ChaosConnectPlugin as lifecycle::Guest>::on_load());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(startup.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
 
     #[test]
     fn list_payload_uses_one_byte_names() {
