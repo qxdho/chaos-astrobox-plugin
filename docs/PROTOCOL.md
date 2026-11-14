@@ -47,13 +47,13 @@ WearPacket.thirdparty_app (field 22)
 
 路径编码为 `[length:u16][UTF-8 bytes]`，单路径不超过255B，无NUL，规整`.`、`..`和重复`/`。上传与复制的临时后缀还需额外空间，过长目标报错。默认只写 `/data`；开发者模式可开放其他实际路径，始终拒绝`/dev`、`/proc`、`/sys`。
 
-状态：0成功；1参数；2不存在；3访问拒绝；4已存在；5非目录；6是目录；7空间不足；8忙/非空；9IO；10CRC；11偏移序列；12不支持；13过大。
+状态：0成功；1参数；2不存在；3访问拒绝；4已存在；5非目录；6是目录；7空间不足；8忙/非空；9IO；10CRC；11偏移序列；12不支持；13过大；14等待手环授权。
 
 ## 操作
 
 | opcode | 请求payload | 成功应答payload |
 |---|---|---|
-| 0x01 HELLO | 空 | version:u8, max_data:u16, flags:u8, dev_mode:u8, max_path:u16, window:u32 |
+| 0x01 HELLO | 空 | version:u8, max_data:u16, flags:u8（bit2=状态/授权能力）, dev_mode:u8, max_path:u16, window:u32 |
 | 0x02 LIST | path, offset:u32, limit:u8（1–16） | total:u16, offset:u16, count:u16, entries |
 | 0x03 STAT | path | is_dir:u8, size:u32, mtime:u32 |
 | 0x04 MKDIR | path | 空 |
@@ -68,9 +68,9 @@ WearPacket.thirdparty_app (field 22)
 | 0x21 WRITE | offset:u32, data | committed_offset:u32, cumulative_crc32:u32 |
 | 0x22 COMMIT | expected_crc32:u32 | 空 |
 | 0x23 ABORT | 空 | 空 |
-| 0x30 PING | 空 | 1:u8 |
+| 0x30 PING | 空 | connected:u8, dev_mode:u8, policy:u8, authorization:u8, token:u32 |
 | 0x31 BENCH_ECHO | 测试数据，长度≤max_data | 原样回显测试数据 |
-| 0x40 SET_DEV | enabled:u8 | 空 |
+| 0x40 SET_DEV | enabled:u8 | 立即完成时空；等待授权为status14 + token:u32 |
 | 0x41 GET_DEV | 空 | enabled:u8 |
 
 LIST每项：name_len:u8、name、is_dir:u8、size:u32、mtime:u32。目录帧也遵守协商容量；不得跳过放不下的大条目再打包后面的条目，否则offset会导致丢项。计数0但仍有条目时明确报TooLarge，不无限分页。
@@ -89,3 +89,11 @@ LIST每项：name_len:u8、name、is_dir:u8、size:u32、mtime:u32。目录帧�
 - 编译、CPU测试、理论窗口带宽、ARM模拟均不能证明无线达标。当前200 kb/s尚待真机验证；回显测速与实际上传/下载需分别记录。
 
 固定互通向量保存在`CHAOSCONNECT-V1.hex`（插件位于`plugin/tests/`）：第一行为HELLO请求CCN1帧（request_id=0x1234），第二行为同一帧的宿主protobuf承载（packet_id=0x12341234）。两仓库的向量逐字节相同，C与Rust测试分别核对。
+
+## 设备状态和开发者模式授权（插件0.2.2）
+
+HELLO flags bit2 (0x04)必须置位。PING状态固定8B；policy=0开启/1关闭/2询问；authorization=0无请求/1等待/2允许/3拒绝/4超时，非0状态必须携带非0 token。connected与dev_mode只能0/1。PING独立于文件请求的pending槽，插件匹配request_id和连接前缀后才消费应答。
+
+SET_DEV(1)：policy开启时立即成功，关闭时Access，询问时Pending(14)+token，设备弹窗确认后通过后续PING同步结果。重复请求复用同一个待定token；60秒授权超时。SET_DEV(0)关闭并取消待定授权。新HELLO、链路断开、桥停止或15秒请求静默清理会话与授权，旧token不能推进新连接。普通心跳每3秒，授权等待每秒，宿主10秒无应答判为断开。发送成功不代表授权成功；授权等待期间插件阻止其它UI文件操作，可发送SET_DEV(0)取消。
+
+状态文件/临时文件及其祖先目录不可通过文件操作改写或重命名。关闭权限会清理系统区域的未提交上传。手环显示关闭权限、用户拒绝、超时等结果均以实际协议状态为准。策略“开启”表示允许插件请求，不会自动打开开发者模式。

@@ -95,6 +95,14 @@ pub fn build(state: &State) -> View {
     root = root.child(header);
 
     if !state.speed.is_empty() { root=root.child(muted(&state.speed)); }
+    if state.connected{
+        root=root.child(muted(format!("手环允许开发者模式：{}",match state.dev_policy{0=>"开启",1=>"关闭",_=>"询问"})));
+    }
+    if state.dev_authorization.is_some(){
+        root=root.child(card().child(title("等待手环处理权限请求",17))
+            .child(muted("请点亮手环屏幕并确认；拒绝、断连或授权超时均不会开启。"))
+            .child(button("取消本次请求","action:cancel-authorization",false)));
+    }
 
     if let Some(select) = device_select(state) {
         root = root.child(card().child(muted("设备")).child(select));

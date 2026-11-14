@@ -43,6 +43,22 @@ pub const ST_CRC: u8 = 10;
 pub const ST_SEQUENCE: u8 = 11;
 pub const ST_UNSUPPORTED: u8 = 12;
 pub const ST_TOO_LARGE: u8 = 13;
+pub const ST_PENDING: u8 = 14;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceStatus {
+    pub connected: bool,
+    pub developer: bool,
+    pub policy: u8,
+    pub authorization: u8,
+    pub token: u32,
+}
+pub fn parse_device_status(data: &[u8]) -> Option<DeviceStatus> {
+    if data.len()!=8||data[0]>1||data[1]>1||data[2]>2||data[3]>4{return None;}
+    let token=get_u32(data,4)?;
+    if (data[0]==0&&data[1]!=0)||(data[3]!=0&&token==0){return None;}
+    Some(DeviceStatus{connected:data[0]!=0,developer:data[1]!=0,policy:data[2],authorization:data[3],token})
+}
 
 pub const CHUNK: usize = 2048;
 
@@ -134,6 +150,7 @@ pub fn status_text(status: u8) -> &'static str {
         ST_SEQUENCE => "传输顺序错误",
         ST_UNSUPPORTED => "当前文件桥/固件不支持该操作",
         ST_TOO_LARGE => "文件大小超出限制",
+        ST_PENDING => "等待手环授权",
         _ => "未知错误",
     }
 }
@@ -235,6 +252,20 @@ mod tests {
     #[test]
     fn crc_matches_standard_vector() {
         assert_eq!(crc32(b"123456789", 0xFFFF_FFFF) ^ 0xFFFF_FFFF, 0xCBF4_3926);
+    }
+
+    #[test]
+    fn device_status_validates_authorization_tokens_and_closed_state() {
+        for auth in 0..=4 {
+            let token=if auth==0{0u32}else{19};
+            let mut data=vec![1,if auth==2{1}else{0},2,auth];put_u32(&mut data,token);
+            let status=parse_device_status(&data).unwrap();
+            assert_eq!((status.authorization,status.token),(auth,token));
+        }
+        for bad in [vec![],vec![1],vec![0,1,2,0,0,0,0,0],vec![1,0,3,0,0,0,0,0],
+                    vec![1,0,2,1,0,0,0,0],vec![1,0,2,5,1,0,0,0]] {
+            assert!(parse_device_status(&bad).is_none());
+        }
     }
 
     #[test]

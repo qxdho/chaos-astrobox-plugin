@@ -145,6 +145,8 @@ pub struct State {
     pub chunk: usize,
     pub speed: String,
     pub dev_mode: bool,
+    pub dev_authorization: Option<(u32,Instant)>,
+    pub dev_policy: u8,
     pub path: String,
     pub entries: Vec<Entry>,
     pub total: u32,
@@ -173,12 +175,14 @@ impl Default for State {
             chunk: protocol::CHUNK,
             speed: String::new(),
             dev_mode: false,
+            dev_authorization: None,
+            dev_policy: 2,
             path: "/data".to_string(),
             entries: Vec::new(),
             total: 0,
             page: 0,
             loading: false,
-            status: "请在 Chaos 设置中开启文件桥，再点击“刷新设备”和“连接ChaosConnect”。".to_string(),
+            status: "请在 Chaos 设置 → ChaosConnect 中启用，再点击“刷新设备”和“连接ChaosConnect”。".to_string(),
             status_error: false,
             detail: None,
             pending: None,
@@ -210,6 +214,8 @@ pub fn snapshot() -> State {
         chunk: state.chunk,
         speed: state.speed.clone(),
         dev_mode: state.dev_mode,
+        dev_authorization: state.dev_authorization,
+        dev_policy: state.dev_policy,
         path: state.path.clone(),
         entries: state.entries.clone(),
         total: state.total,
@@ -278,6 +284,9 @@ pub fn reset_path(path: &str) {
 pub fn clear_connection() {
     with_state(|state| {
         state.connected = false;
+        state.dev_mode = false;
+        state.dev_authorization = None;
+        state.busy = false;
         state.entries.clear();
         state.total = 0;
         state.detail = None;

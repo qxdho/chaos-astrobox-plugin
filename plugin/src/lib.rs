@@ -37,6 +37,8 @@ static RECEIVE_BUSY: AtomicBool = AtomicBool::new(false);
 static RECEIVE_QUEUE: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 static WATCHDOG_TIMER: Mutex<Option<u64>> = Mutex::new(None);
 static UPLOAD_TIMER: Mutex<Option<u64>> = Mutex::new(None);
+static HEARTBEAT:Mutex<Option<(u16,Instant)>>=Mutex::new(None);
+static LAST_HEARTBEAT:Mutex<Option<Instant>>=Mutex::new(None);
 
 const EVENT_DEVICE: &str = "input:device";
 
@@ -117,6 +119,7 @@ async fn refresh_devices() {
         if state::with_state(|s|s.upload.is_some()){cancel_upload_with("设备断开，已取消上传。".into()).await;}
         if state::with_state(|s|s.download.is_some()){cancel_download().await;}
         if state::with_state(|s|s.benchmark.is_some()){end_benchmark(Some("设备已断开。".into()));}
+        state::clear_connection();
     }
     state::with_state(|state| {
         state.devices = devices;
@@ -141,6 +144,8 @@ async fn refresh_devices() {
 }
 
 async fn connect_bridge() {
+    *HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
+    *LAST_HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
     let addr = state::selected_addr();
     if addr.is_empty() {
         state::set_status("请先选择已连接的手环。", true);
@@ -149,6 +154,8 @@ async fn connect_bridge() {
     }
     state::with_state(|state| {
         state.connected = false;
+        state.dev_mode = false;
+        state.dev_authorization = None;
         state.busy = true;
         state.status = "正在连接 ChaosConnect…".to_string();
         state.status_error = false;
@@ -405,13 +412,28 @@ async fn send_delete(path: String, is_dir: bool) {
 }
 
 async fn send_set_dev(enabled: bool) {
+    if !state::with_state(|s|s.connected&&!s.busy&&s.transfer.is_none()){return;}
+    let previous_authorization=state::with_state(|s|s.dev_authorization);
+    state::with_state(|s|{
+        s.busy=true;
+        s.dev_authorization=Some((0,Instant::now()));
+        s.status=if enabled{"正在请求手环开启开发者模式…".into()}else{"正在关闭开发者模式…".into()};
+        s.status_error=false;
+    });
+    rerender();
     let req = next_req();
     set_pending(Pending::SetDev { enabled }, req);
     if let Err(error) = send_req(OP_SET_DEV, req, &[if enabled { 1 } else { 0 }]).await {
         state::with_state(|state| {
             state.pending = None;
+            state.busy = false;
+            state.dev_authorization = None;
             state.status = format!("切换开发者模式失败：{error}");
             state.status_error = true;
+            if !enabled&&previous_authorization.is_some(){
+                state.busy=true;state.dev_authorization=previous_authorization;
+                state.status=format!("取消请求未送达：{error}。请在手环选择拒绝，或等待授权超时。");
+            }
         });
         rerender();
     }
@@ -953,6 +975,14 @@ async fn on_read_response(status: u8, payload: &[u8], offset: u32) {
 }
 
 async fn handle_ui_event(event_id: &str, payload: &str) {
+    if state::with_state(|s|s.dev_authorization.is_some())&&event_id!="action:cancel-authorization"{
+        state::set_status("请先在手环完成授权，或取消本次请求。",false);rerender();return;
+    }
+    if event_id=="action:cancel-authorization"{
+        // A disabling request also invalidates the device's pending authorization token.
+        state::with_state(|s|s.busy=false);
+        send_set_dev(false).await;return;
+    }
     if event_id == "input:preview" {
         let value = event_value(payload);
         state::with_state(|state| {
@@ -1199,7 +1229,7 @@ async fn handle_hello(response: &Response<'_>) {
     let version = response.payload[0];
     let dev = response.payload[4] != 0;
     let chunk=get_u16(response.payload,1).unwrap_or(0) as usize;
-    if version!=PROTO_VERSION||chunk==0||chunk>CHUNK||get_u32(response.payload,7)!=Some(WINDOW as u32){
+    if version!=PROTO_VERSION||chunk==0||chunk>CHUNK||get_u32(response.payload,7)!=Some(WINDOW as u32)||response.payload[3]&4==0{
         state::with_state(|s|{s.busy=false;s.connected=false;});
         state::set_status("ChaosConnect版本或协商块大小不兼容，请同时更新插件和Chaos。",true);rerender();return;
     }
@@ -1211,9 +1241,12 @@ async fn handle_hello(response: &Response<'_>) {
         state.status = format!("已连接 ChaosConnect v{version} · {chunk} B × {WINDOW}窗口");
         state.status_error = false;
     });
-    {let mut timer=WATCHDOG_TIMER.lock().unwrap_or_else(|e|e.into_inner());
-     if timer.is_none(){let id=timer::set_interval(1000,"transfer-watchdog");if id!=0{*timer=Some(id);}}}
-    load_dir("/data".to_string()).await;
+    let has_timer={let mut timer=WATCHDOG_TIMER.lock().unwrap_or_else(|e|e.into_inner());
+     if timer.is_none(){let id=timer::set_interval(1000,"transfer-watchdog");if id!=0{*timer=Some(id);}}
+     timer.is_some()};
+    if !has_timer{connection_lost("无法启动心跳定时器，请重启插件后重新连接。").await;return;}
+    heartbeat().await;
+    if state::with_state(|s|s.connected){load_dir("/data".to_string()).await;}
 }
 
 fn parse_list_entries(payload: &[u8]) -> Option<(u16, u16, u16, Vec<Entry>)> {
@@ -1566,10 +1599,78 @@ async fn handle_download_open(pending: Pending, response: &Response<'_>) {
     rerender();
 }
 
+async fn connection_lost(reason:&str){
+    *HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
+    if state::with_state(|s|s.upload.is_some()){cancel_upload_with(reason.into()).await;}
+    if state::with_state(|s|s.download.is_some()){cancel_download().await;}
+    if state::with_state(|s|s.benchmark.is_some()){end_benchmark(Some(reason.into()));}
+    state::clear_connection();
+    state::set_status(reason,true);rerender();
+}
+
+async fn heartbeat(){
+    if !state::with_state(|s|s.connected){return;}
+    let in_flight=*HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner());
+    if let Some((_,sent))=in_flight{
+        if sent.elapsed().as_secs()>=10{connection_lost("手环心跳超时，已断开；请重新连接ChaosConnect。").await;}
+        return;
+    }
+    let interval=if state::with_state(|s|s.dev_authorization.is_some()){1}else{3};
+    if LAST_HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner()).is_some_and(|t|t.elapsed().as_secs()<interval){return;}
+    let req=next_req();let now=Instant::now();
+    *HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=Some((req,now));
+    *LAST_HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=Some(now);
+    if let Err(error)=send_req(OP_PING,req,&[]).await{
+        connection_lost(&format!("心跳发送失败：{error}")).await;
+    }
+}
+
+async fn apply_device_status(status:DeviceStatus){
+    if !status.connected{connection_lost("手环已结束ChaosConnect会话，请重新连接。").await;return;}
+    let mut changed=false;
+    state::with_state(|s|{
+        changed=s.dev_mode!=status.developer||s.dev_policy!=status.policy;
+        let revoked=s.dev_mode&&!status.developer;
+        s.dev_mode=status.developer;s.dev_policy=status.policy;
+        if let Some((token,started))=s.dev_authorization{
+            if token!=0&&status.token==token&&status.authorization==1{return;}
+            if token==0&&started.elapsed().as_secs()<8{return;}
+            if token==0&&status.authorization==1&&status.token!=0{
+                s.dev_authorization=Some((status.token,Instant::now()));
+                s.pending=None;s.pending_req=0;
+                s.status="手环正在等待授权，请点亮屏幕并确认。".into();s.status_error=false;changed=true;return;
+            }
+            s.dev_authorization=None;s.busy=false;changed=true;
+            let (message,error)=if token==0{
+                ("操作应答超时，已同步手环实际状态。",true)
+            }else if status.token!=token||status.authorization==0{
+                ("手环已取消本次授权请求。",true)
+            }else{match status.authorization{
+                2 if status.developer=>("手环已允许，开发者模式已开启。",false),
+                3=>("手环已拒绝，开发者模式未开启。",true),
+                4=>("手环授权超时，开发者模式未开启。",true),
+                _=>("手环未开启开发者模式，已同步实际状态。",true),
+            }};
+            s.status=message.into();s.status_error=error;
+            if matches!(s.pending,Some(Pending::SetDev{..})){s.pending=None;s.pending_req=0;}
+        }else if revoked{s.status="手环已撤销开发者模式。".into();s.status_error=false;}
+    });
+    if changed{rerender();}
+}
+
 async fn handle_set_dev(pending: Pending, response: &Response<'_>) {
     let Pending::SetDev { enabled } = pending else {
         return;
     };
+    if enabled&&response.status==ST_PENDING{
+        let Some(token)=get_u32(response.payload,0).filter(|t|*t!=0)else{
+            state::with_state(|s|{s.busy=false;s.dev_authorization=None;});
+            state::set_status("手环返回了无效授权编号，未开启开发者模式。",true);rerender();return;
+        };
+        state::with_state(|s|{s.dev_authorization=Some((token,Instant::now()));s.status="请点亮手环屏幕，确认是否允许启用开发者模式（60秒内有效）。".into();s.status_error=false;});
+        rerender();return;
+    }
+    state::with_state(|s|{s.busy=false;s.dev_authorization=None;});
     if response.status != ST_OK {
         state::set_status(
             format!("切换开发者模式失败：{}", status_text(response.status)),
@@ -1604,6 +1705,7 @@ impl event::Guest for ChaosConnectPlugin {
                 if timer_name=="benchmark"{drive_benchmark().await;} else if timer_name == "upload" {
                     drive_upload().await;
                 } else if timer_name=="transfer-watchdog"{
+                    heartbeat().await;
                     let upload_expired=state::with_state(|s|s.upload.as_ref().is_some_and(|u|u.last_ack.elapsed().as_secs()>=15));
                     if upload_expired{cancel_upload_with("等待上传或提交应答超时，请刷新目录核对结果。".into()).await;}
                     let expired=state::with_state(|s|s.download.as_ref().is_some_and(|d|d.last_ack.elapsed().as_secs()>=15));
@@ -1670,6 +1772,15 @@ async fn receive_frame(packet:&[u8]){
         let Some(response) = parse_response(frame) else {
             return;
         };
+        if response.op==OP_PING{
+            let expected={let mut h=HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner());
+                if h.is_some_and(|(req,_)|req==response.req){h.take();true}else{false}};
+            if expected{
+                if let Some(status)=parse_device_status(response.payload).filter(|_|response.status==ST_OK){apply_device_status(status).await;}
+                else{connection_lost("设备状态应答无效，已断开，请同时更新Chaos和插件。").await;}
+            }
+            return;
+        }
         if response.op==0x31{
             let chunk=state::with_state(|s|s.benchmark.as_mut().and_then(|b|b.inflight.remove(&response.req)));
             if let Some((offset,n))=chunk{
@@ -1738,6 +1849,31 @@ mod tests {
         let mut startup = std::pin::pin!(<ChaosConnectPlugin as lifecycle::Guest>::on_load());
         let mut cx = Context::from_waker(Waker::noop());
         assert!(matches!(startup.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    #[test]
+    fn authorization_wait_allow_reject_revoke_and_cancel_follow_device_status() {
+        fn apply(status:DeviceStatus){
+            use std::future::Future;
+            use std::task::{Context,Poll,Waker};
+            let mut future=std::pin::pin!(apply_device_status(status));
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())),Poll::Ready(())));
+        }
+        state::with_state(|s|{*s=state::State::default();s.connected=true;s.busy=true;s.dev_authorization=Some((19,Instant::now()));});
+        let mut status=DeviceStatus{connected:true,developer:false,policy:2,authorization:1,token:19};
+        apply(status);assert!(state::with_state(|s|s.busy&&!s.dev_mode&&s.dev_authorization.is_some()));
+        status.authorization=2;status.developer=true;apply(status);
+        assert!(state::with_state(|s|s.dev_mode&&!s.busy&&s.dev_authorization.is_none()));
+        status.policy=1;status.developer=false;status.authorization=3;apply(status);
+        assert!(!state::with_state(|s|s.dev_mode));
+        for (token,auth) in [(19,3),(19,4),(20,2),(0,0)]{
+            state::with_state(|s|{s.busy=true;s.dev_authorization=Some((19,Instant::now()));});
+            status.token=token;status.authorization=auth;apply(status);
+            assert!(state::with_state(|s|!s.dev_mode&&!s.busy&&s.dev_authorization.is_none()));
+        }
+        state::with_state(|s|{s.dev_mode=true;s.dev_authorization=Some((19,Instant::now()));s.busy=true;});
+        state::clear_connection();
+        assert!(state::with_state(|s|!s.connected&&!s.dev_mode&&!s.busy&&s.dev_authorization.is_none()));
     }
 
     #[test]
