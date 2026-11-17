@@ -6,6 +6,7 @@ use crate::astrobox::psys_host_v4::ui;
 pub enum On {
     Click,
     Change,
+    Input,
 }
 
 pub struct View {
@@ -197,6 +198,7 @@ impl View {
         for (event, id) in &self.events {
             let event = match event {
                 On::Click => ui::Event::Click,
+                On::Input => ui::Event::Input,
                 On::Change => ui::Event::Change,
             };
             element = element.on(event, id);

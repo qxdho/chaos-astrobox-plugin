@@ -22,6 +22,8 @@ mod page;
 mod protocol;
 mod state;
 mod view;
+mod terminal;
+static TERMINAL_TIMER:Mutex<Option<u64>>=Mutex::new(None);
 
 wit_bindgen::generate!({
     path: "wit",
@@ -144,6 +146,7 @@ async fn refresh_devices() {
 }
 
 async fn connect_bridge() {
+    clear_terminal_timer();state::with_state(|s|s.terminal=Default::default());
     *HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
     *LAST_HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
     let addr = state::selected_addr();
@@ -974,7 +977,56 @@ async fn on_read_response(status: u8, payload: &[u8], offset: u32) {
     rerender_progress();
 }
 
+async fn terminal_request(op:u8,data:&[u8]){
+    if !state::with_state(|s|s.connected&&!s.terminal.busy()){return;}
+    let req=next_req();state::with_state(|s|s.terminal.pending=Some((req,op,Instant::now())));
+    if let Err(error)=send_req(op,req,data).await{state::with_state(|s|{s.terminal.pending=None;s.terminal.lease=0;s.terminal.message=format!("NSH发送失败，未自动重发：{error}");});}
+    if op!=0x52{rerender();}
+}
+fn clear_terminal_timer(){if let Some(id)=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner()).take(){timer::clear_timer(id);}}
+async fn terminal_tick(){
+    if !state::with_state(|s|s.connected&&(s.terminal.active()||s.terminal.busy())){clear_terminal_timer();return;}
+    if state::with_state(|s|s.terminal.pending.is_some_and(|(_,_,at)|at.elapsed().as_secs()>=10)){
+        connection_lost("NSH应答超时，已结束连接；命令不会自动重发").await;return;
+    }
+    let action=state::with_state(|s|{
+        let t=&mut s.terminal;if !s.connected{return None;}
+        if t.busy()||t.lease==0{return None;}
+        let mut p=t.lease.to_le_bytes().to_vec();
+        if t.closing{return Some((0x53,p));}
+        if !t.visible&&t.last_poll.is_some_and(|at|at.elapsed().as_millis()<1000){return None;}
+        t.last_poll=Some(Instant::now());put_u16(&mut p,s.chunk.min(CHUNK)as u16);Some((0x52,p))
+    });
+    if let Some((op,p))=action{terminal_request(op,&p).await;}
+}
+async fn terminal_event(id:&str,payload:&str){
+    match id {
+        "input:nsh"=>{state::with_state(|s|s.terminal.input=event_value(payload).chars().take(2048).collect());rerender();return;},
+        "terminal:show"=>state::with_state(|s|s.terminal.visible=true),
+        "terminal:back"=>state::with_state(|s|s.terminal.visible=false),
+        "terminal:clear"=>state::with_state(|s|s.terminal.output.clear()),
+        "terminal:stop"=>{state::with_state(|s|s.terminal.closing=true);terminal_tick().await;},
+        "terminal:start"=>{
+            if state::with_state(|s|s.upload.is_some()||s.download.is_some()||s.benchmark.is_some()){state::set_status("请先完成文件传输或测速",true);rerender();return;}
+            state::with_state(|s|{s.terminal.closing=false;s.terminal.message="正在启动NSH终端…".into();});
+            let supported=state::with_state(|s|s.terminal.supported);if !supported{state::with_state(|s|s.terminal.message="请更新支持NSH的Chaos模块".into());rerender();return;}
+            terminal_request(0x50,&[]).await;
+            let ready={let mut timer=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner());
+                if timer.is_none(){let id=timer::set_interval(250,"nsh-terminal");if id!=0{*timer=Some(id);}}timer.is_some()};
+            if !ready{state::with_state(|s|{s.terminal.closing=true;s.terminal.message="无法启动终端读取定时器".into();});terminal_tick().await;}
+        },
+        "terminal:send"|"terminal:interrupt"=>{
+            let data=state::with_state(|s|{let t=&mut s.terminal;if !t.active()||t.busy()||t.closing{return None;}
+                let input=if id=="terminal:interrupt"{vec![3]}else{let mut bytes=t.input.as_bytes().to_vec();bytes.push(b'\n');bytes};
+                if input.len()>s.chunk||input.iter().any(|b|*b==0||*b==4){t.message="输入超过协商长度或包含不支持的字符".into();return None;}
+                let mut p=t.lease.to_le_bytes().to_vec();p.extend_from_slice(&input);t.input.clear();Some(p)});
+            if let Some(p)=data{terminal_request(0x51,&p).await;}
+        },_=>{}
+    }rerender();
+}
+
 async fn handle_ui_event(event_id: &str, payload: &str) {
+    if event_id.starts_with("terminal:")||event_id=="input:nsh"{terminal_event(event_id,payload).await;return;}
     if state::with_state(|s|s.dev_authorization.is_some())&&event_id!="action:cancel-authorization"{
         state::set_status("请先在手环完成授权，或取消本次请求。",false);rerender();return;
     }
@@ -1235,7 +1287,7 @@ async fn handle_hello(response: &Response<'_>) {
     }
     state::with_state(|state| {
         state.connected = true;
-        state.chunk=chunk;
+        state.chunk=chunk;state.terminal.supported=response.payload[3]&16!=0;
         state.busy = false;
         state.dev_mode = dev;
         state.status = format!("已连接 ChaosConnect v{version} · {chunk} B × {WINDOW}窗口");
@@ -1600,6 +1652,7 @@ async fn handle_download_open(pending: Pending, response: &Response<'_>) {
 }
 
 async fn connection_lost(reason:&str){
+    clear_terminal_timer();
     *HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
     if state::with_state(|s|s.upload.is_some()){cancel_upload_with(reason.into()).await;}
     if state::with_state(|s|s.download.is_some()){cancel_download().await;}
@@ -1702,7 +1755,7 @@ impl event::Guest for ChaosConnectPlugin {
             }
             EventType::Timer => {
                 let timer_name = timer_payload(&event_payload);
-                if timer_name=="benchmark"{drive_benchmark().await;} else if timer_name == "upload" {
+                if timer_name=="nsh-terminal"{terminal_tick().await;} else if timer_name=="benchmark"{drive_benchmark().await;} else if timer_name == "upload" {
                     drive_upload().await;
                 } else if timer_name=="transfer-watchdog"{
                     heartbeat().await;
@@ -1779,6 +1832,12 @@ async fn receive_frame(packet:&[u8]){
         let Some(response) = parse_response(frame) else {
             return;
         };
+        if (0x50..=0x53).contains(&response.op){
+            let changed=state::with_state(|s|{let before=(s.terminal.output.clone(),s.terminal.message.clone(),s.terminal.lease,s.terminal.pending.is_some());
+                if let Err(e)=s.terminal.apply(&response){s.terminal.message=e;s.terminal.lease=0;}
+                before.0!=s.terminal.output||before.1!=s.terminal.message||before.2!=s.terminal.lease||(response.op!=0x52&&before.3)});
+            if changed{rerender_progress();}return;
+        }
         if response.op==OP_PING{
             let expected={let mut h=HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner());
                 if h.is_some_and(|(req,_)|req==response.req){h.take();true}else{false}};

@@ -1,0 +1,14 @@
+{
+  "version": "0.3.0",
+  "tests": {
+    "passed": 20,
+    "failed": 0
+  },
+  "build": "wasm32-wasip2 / API Level4 WASI3",
+  "artifact": {
+    "name": "chaos-connect.abp",
+    "bytes": 158873,
+    "sha256": "06f2784f94ae927365d2ec6d15a30c6343309c35c1f1e382b7c4f4557352a149"
+  },
+  "hardwareNshExecutionTested": false
+}

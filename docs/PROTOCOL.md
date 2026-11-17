@@ -103,3 +103,16 @@ SET_DEV(1)：policy开启时立即成功，关闭时Access，询问时Pending(14
 `flags=2, opcode=0xC2, status=0, req=0`；payload与PING的8B状态布局相同。外层ID低16位=0，高16位为关闭前会话前缀。connected=0时插件立即结束连接，清除开发者模式与待定授权并取消文件操作。命名空间/CRC/连接前缀校验仍强制执行，旧会话事件不影响新会话。
 
 手环开关的原生门禁在配置写盘之前关闭，不等待维护timer；已排队的旧请求和文件应答均作废。仅允许BT owner尝试发送这条停用通知（最多3次，失败仍以心跳超时兜底）。重新开启仅接受新HELLO，不恢复旧会话和授权。
+
+## NSH终端（0.3.0）
+
+HELLO capabilities bit `0x10` 表示独立NSH后端可用。插件由实际载波获得插件权限，手环中需单独允许mask `0x20`，默认关闭；与Android端NSH权限独立。
+
+- `0x50 OPEN`：空请求；返回 `lease:u32LE + state:u8 + error:i32LE`。
+- `0x51 WRITE`：`lease + bytes`，输入不超过协商chunk，成功返回空。
+- `0x52 READ`：`lease + capacity:u16LE`，返回9字节状态头及输出。
+- `0x53 CLOSE`：`lease`，成功返回空。
+
+state：0空闲／1启动中／2运行中／3已退出／4失败／5停止中。所有操作绑定当前连接prefix与lease。一次只有一个NSH请求在途；写入失败或超时不重发命令，10秒无应答结束连接。启动时不与文件传输／测速同时发起。停止期间等待当前应答后关闭已打开的lease；服务停用、设备切换、断线清空本地状态。每次读取/输入仍由模块执行插件NSH权限门禁。
+
+参考：[v4概览](https://abox.run/docs/plugin-development/v4)、[UI](https://abox.run/docs/plugin-development/v2/host-api/ui-v3)、[Timer](https://abox.run/docs/plugin-development/v2/host-api/timer)、[Transport](https://abox.run/docs/plugin-development/v2/host-api/transport)。v4继续采用项目已有`psys_host_v4`异步WIT接口。

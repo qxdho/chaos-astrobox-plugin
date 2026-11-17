@@ -66,3 +66,11 @@ sh scripts/build_plugin.sh
 ## 0.2.4 显示信息
 
 插件显示名称为“Chaos Connect”，作者`IKUN_CXKPRO`，图标直接使用Chaos原始`tools/chaos.png`。测速结果只显示`KB/s · kb/s`，不再显示是否达到200kb/s。配套Chaos修复日志视口偏移、状态主副标题刷新，并在新授权请求时亮屏和震动一次。
+
+## 0.3.0 NSH终端
+
+连接后选择 **NSH终端**，在手环 ChaosConnect → 权限设置 → 插件权限中允许“NSH终端”，再点击“启动终端”。命令直接连接手环独立原生 PTY，不依赖开发者模式；支持 UTF-8 输出、命令发送、Ctrl+C、停止和清空输出。返回文件管理可继续使用原文件功能。
+
+按官方 [v4异步接口](https://abox.run/docs/plugin-development/v4/whats-new) 和现有 UI／Timer／Transport API 接入，无新增宿主权限。终端采用 `0x50..0x53` 与 lease，旧应答／旧会话不能推进新命令；命令不在不确定结果后自动重发。撤权和断连停止访问。最多保留32KiB文字输出，常见ANSI控制序列被过滤，不是完整VT100。可见时约250ms读取，回到文件管理后最多每秒一次；空输出不重复刷新整个页面。
+
+`cargo test --manifest-path plugin/Cargo.toml --lib` 20项通过；`sh scripts/build_plugin.sh` 产出 `dist/chaos-connect.abp`。已验证解析、lease、撤权、分段UTF-8及有界输出，尚未在真实AstroBox与手环上执行命令。需要同时使用支持NSH协议的Chaos版本。
