@@ -1,6 +1,6 @@
 # Chaos Connect（AstroBox v4）
 
-适配 Chaos 原生文件桥的新私有协议 **ChaosConnect v1**。插件0.2.4不再调用 CanopusConnect，不需要模块管理器；必须同时更新 Chaos 与插件，旧 band_files 插件不兼容。
+适配 Chaos 原生文件桥的新私有协议 **ChaosConnect v1**。插件0.3.0不再调用 CanopusConnect，不需要模块管理器；必须同时更新 Chaos 与插件，旧 band_files 插件不兼容。
 
 ## 使用
 
