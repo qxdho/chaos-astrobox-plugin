@@ -1013,7 +1013,7 @@ async fn terminal_event(id:&str,payload:&str){
             terminal_request(0x50,&[]).await;
             let ready={let mut timer=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner());
                 if timer.is_none(){let id=timer::set_interval(250,"nsh-terminal");if id!=0{*timer=Some(id);}}timer.is_some()};
-            if !ready{state::with_state(|s|{s.terminal.closing=true;s.terminal.message="无法启动终端读取定时器".into();});terminal_tick().await;}
+            if !ready{connection_lost("无法启动NSH读取定时器，已结束连接；请重新连接").await;return;}
         },
         "terminal:send"|"terminal:interrupt"=>{
             let data=state::with_state(|s|{let t=&mut s.terminal;if !t.active()||t.busy()||t.closing{return None;}

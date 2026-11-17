@@ -7,8 +7,8 @@
   "build": "wasm32-wasip2 / API Level4 WASI3",
   "artifact": {
     "name": "chaos-connect.abp",
-    "bytes": 158873,
-    "sha256": "06f2784f94ae927365d2ec6d15a30c6343309c35c1f1e382b7c4f4557352a149"
+    "bytes": 158870,
+    "sha256": "e037fb53d99c1e591bf845c4e06ab43e274496bb827ba878bf4ca418793ad37c"
   },
   "hardwareNshExecutionTested": false
 }
