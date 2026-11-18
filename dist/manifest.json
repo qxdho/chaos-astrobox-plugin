@@ -1,8 +1,8 @@
 {
   "name": "Chaos Connect",
   "icon": "icon.png",
-  "version": "0.3.2",
-  "description": "通过ChaosConnect管理设备文件并连接手环独立NSH终端，支持权限管控、窗口传输与CRC校验。",
+  "version": "0.3.3",
+  "description": "通过ChaosConnect私有协议管理设备文件，支持窗口传输、CRC校验及实际速度统计。",
   "author": "IKUN_CXKPRO",
   "website": "",
   "entry": "astrobox_plugin_chaos_connect.wasm",

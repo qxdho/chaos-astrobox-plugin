@@ -22,8 +22,6 @@ mod page;
 mod protocol;
 mod state;
 mod view;
-mod terminal;
-static TERMINAL_TIMER:Mutex<Option<u64>>=Mutex::new(None);
 
 wit_bindgen::generate!({
     path: "wit",
@@ -51,9 +49,6 @@ fn next_req() -> u16 {
 }
 
 fn rerender() {
-    // Native command editing stays inside the host. Collect output in the
-    // background and render once after the dialog, without per-key callbacks.
-    if state::with_state(|s|{if s.terminal.defer_render(Instant::now()){s.terminal.render_dirty=true;true}else{s.terminal.render_dirty=false;false}}){return;}
     let snapshot = state::snapshot();
     if let Some(root) = &snapshot.root {
         ui::render(root, page::build(&snapshot).into_element());
@@ -149,7 +144,6 @@ async fn refresh_devices() {
 }
 
 async fn connect_bridge() {
-    clear_terminal_timer();state::with_state(|s|s.terminal=Default::default());
     *HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
     *LAST_HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
     let addr = state::selected_addr();
@@ -955,61 +949,7 @@ async fn on_read_response(status: u8, payload: &[u8], offset: u32) {
     rerender_progress();
 }
 
-fn clear_terminal_timer(){if let Some(id)=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner()).take(){timer::clear_timer(id);}}
-fn ensure_terminal_timer()->bool {
-    let mut timer=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner());
-    if timer.is_none(){let id=timer::set_interval(250,"nsh-terminal");if id!=0{*timer=Some(id);}}timer.is_some()
-}
-async fn terminal_tick(){
-    if !state::with_state(|s|s.connected&&s.terminal.needs_timer()){clear_terminal_timer();return;}
-    if state::with_state(|s|s.terminal.pending.is_some_and(|(_,_,at)|at.elapsed().as_secs()>=10)){
-        connection_lost("NSH应答超时，已结束连接；命令不会自动重发").await;return;
-    }
-    let action=state::with_state(|s|{
-        if !s.connected{return None;}
-        let before=s.terminal.message.clone();
-        let action=s.terminal.next_action(Instant::now(),s.chunk.min(CHUNK));
-        if s.terminal.message!=before{s.terminal.render_dirty=true;}
-        let (op,payload)=action?;
-        let req=next_req();s.terminal.pending=Some((req,op,Instant::now()));Some((op,req,payload))
-    });
-    if let Some((op,req,payload))=action{
-        if let Err(error)=send_req(op,req,&payload).await{state::with_state(|s|s.terminal.send_failed(&error));rerender();}
-    }
-    let flush=state::with_state(|s|s.terminal.render_dirty&&!s.terminal.defer_render(Instant::now()));
-    if flush{rerender();}
-}
-async fn terminal_event(id:&str,_payload:&str){
-    match id {
-        "terminal:edit"=>{
-            let context=PREFIX.load(Ordering::SeqCst);
-            let current=state::with_state(|s|{if s.terminal.editing{return None;}s.terminal.editing=true;Some(s.terminal.input.clone())});
-            let Some(current)=current else{return;};
-            let prompt=if current.is_empty(){"输入NSH命令，确定后点击发送。".to_string()}else{format!("当前待发送：{current}\n输入新的NSH命令，确定后点击发送。")};
-            let value=dialog_input("NSH命令",&prompt).await;
-            state::with_state(|s|s.terminal.finish_edit(if context==PREFIX.load(Ordering::SeqCst){value}else{None},Instant::now()));
-        },
-        "terminal:show"=>state::with_state(|s|s.terminal.visible=true),
-        "terminal:back"=>state::with_state(|s|{s.terminal.visible=false;}),
-        "terminal:clear"=>state::with_state(|s|s.terminal.output.clear()),
-        "terminal:stop"=>{state::with_state(|s|s.terminal.stop());terminal_tick().await;},
-        "terminal:start"=>{
-            if state::with_state(|s|s.upload.is_some()||s.download.is_some()||s.benchmark.is_some()){state::set_status("请先完成文件传输或测速",true);rerender();return;}
-            if !state::with_state(|s|s.terminal.supported){state::with_state(|s|s.terminal.message="请更新支持NSH的Chaos模块".into());rerender();return;}
-            state::with_state(|s|s.terminal.begin_open(Instant::now()));
-            if !ensure_terminal_timer(){connection_lost("无法启动NSH读取定时器，已结束连接；请重新连接").await;return;}
-            terminal_tick().await;
-        },
-        "terminal:send"|"terminal:interrupt"=>{
-            state::with_state(|s|{if let Err(e)=s.terminal.enqueue(id=="terminal:interrupt",s.chunk){s.terminal.message=e;}});
-            // An outstanding READ simply finishes before the queued WRITE.
-            terminal_tick().await;
-        },_=>{}
-    }rerender();
-}
-
 async fn handle_ui_event(event_id: &str, payload: &str) {
-    if event_id.starts_with("terminal:"){terminal_event(event_id,payload).await;return;}
     if state::with_state(|s|s.dev_authorization.is_some())&&event_id!="action:cancel-authorization"{
         state::set_status("请先在手环完成授权，或取消本次请求。",false);rerender();return;
     }
@@ -1270,7 +1210,7 @@ async fn handle_hello(response: &Response<'_>) {
     }
     state::with_state(|state| {
         state.connected = true;
-        state.chunk=chunk;state.terminal.supported=response.payload[3]&16!=0;
+        state.chunk=chunk;
         state.busy = false;
         state.dev_mode = dev;
         state.status = format!("已连接 ChaosConnect v{version} · {chunk} B × {WINDOW}窗口");
@@ -1635,7 +1575,6 @@ async fn handle_download_open(pending: Pending, response: &Response<'_>) {
 }
 
 async fn connection_lost(reason:&str){
-    clear_terminal_timer();
     *HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner())=None;
     if state::with_state(|s|s.upload.is_some()){cancel_upload_with(reason.into()).await;}
     if state::with_state(|s|s.download.is_some()){cancel_download().await;}
@@ -1738,7 +1677,7 @@ impl event::Guest for ChaosConnectPlugin {
             }
             EventType::Timer => {
                 let timer_name = timer_payload(&event_payload);
-                if timer_name=="nsh-terminal"{terminal_tick().await;} else if timer_name=="benchmark"{drive_benchmark().await;} else if timer_name == "upload" {
+                if timer_name=="benchmark"{drive_benchmark().await;} else if timer_name == "upload" {
                     drive_upload().await;
                 } else if timer_name=="transfer-watchdog"{
                     heartbeat().await;
@@ -1815,13 +1754,6 @@ async fn receive_frame(packet:&[u8]){
         let Some(response) = parse_response(frame) else {
             return;
         };
-        if (0x50..=0x53).contains(&response.op){
-            let changed=state::with_state(|s|{let before=(s.terminal.output.clone(),s.terminal.message.clone(),s.terminal.lease,s.terminal.pending.is_some());
-                if let Err(e)=s.terminal.apply(&response){s.terminal.send_failed(&e);}
-                before.0!=s.terminal.output||before.1!=s.terminal.message||before.2!=s.terminal.lease||(response.op!=0x52&&before.3)});
-            terminal_tick().await;
-            if changed{rerender_progress();}return;
-        }
         if response.op==OP_PING{
             let expected={let mut h=HEARTBEAT.lock().unwrap_or_else(|e|e.into_inner());
                 if h.is_some_and(|(req,_)|req==response.req){h.take();true}else{false}};
@@ -1997,7 +1929,7 @@ mod timer_tests {
     }
 }
 
-#[cfg(test)]mod terminal_input_tests {
+#[cfg(test)]mod input_payload_tests {
     #[test]fn host_input_payload_keeps_json_escapes_and_unicode(){
         assert_eq!(super::event_value(r#"{"value":"echo \"中文\" C:\\data\n\uD83D\uDE00"}"#),"echo \"中文\" C:\\data\n😀");
         assert_eq!(super::event_value(r#"{"target":{"value":"pwd"}}"#),"pwd");

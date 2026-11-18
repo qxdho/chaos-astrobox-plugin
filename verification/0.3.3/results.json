@@ -1,0 +1,16 @@
+{
+  "version": "0.3.3",
+  "pluginNshRemoved": true,
+  "tests": {
+    "passed": 18,
+    "failed": 0,
+    "skipped": 0
+  },
+  "moduleProtocolTests": 31,
+  "artifact": {
+    "name": "chaos-connect.abp",
+    "bytes": 162507,
+    "sha256": "7c2ae4ac86b7c3575b3d6ba6f3ae2f55fcfe8baa2c902cb33a1da4a7721e448a"
+  },
+  "hardwareVerified": false
+}

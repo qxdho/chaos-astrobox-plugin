@@ -104,29 +104,7 @@ SET_DEV(1)：policy开启时立即成功，关闭时Access，询问时Pending(14
 
 手环开关的原生门禁在配置写盘之前关闭，不等待维护timer；已排队的旧请求和文件应答均作废。仅允许BT owner尝试发送这条停用通知（最多3次，失败仍以心跳超时兜底）。重新开启仅接受新HELLO，不恢复旧会话和授权。
 
-## NSH终端（0.3.0）
 
-HELLO capabilities bit `0x10` 表示独立NSH后端可用。插件由实际载波识别身份。自0.3.2起插件NSH取消独立mask门禁；Android端仍需允许NSH mask `0x20`，默认关闭。两端均需通过本次连接确认。
+## 0.3.3 功能范围
 
-- `0x50 OPEN`：空请求；返回 `lease:u32LE + state:u8 + error:i32LE`。
-- `0x51 WRITE`：`lease + bytes`，输入不超过协商chunk，成功返回空。
-- `0x52 READ`：`lease + capacity:u16LE`，返回9字节状态头及输出。
-- `0x53 CLOSE`：`lease`，成功返回空。
-
-state：0空闲／1启动中／2运行中／3已退出／4失败／5停止中。所有操作绑定当前连接prefix与lease。一次只有一个NSH请求在途；写入失败或超时不重发命令，10秒无应答结束连接。启动时不与文件传输／测速同时发起。停止期间等待当前应答后关闭已打开的lease；服务停用、设备切换、断线清空本地状态。每次读取/输入仍由模块执行连接许可与服务启用门禁。
-
-参考：[v4概览](https://abox.run/docs/plugin-development/v4)、[UI](https://abox.run/docs/plugin-development/v2/host-api/ui-v3)、[Timer](https://abox.run/docs/plugin-development/v2/host-api/timer)、[Transport](https://abox.run/docs/plugin-development/v2/host-api/transport)。v4继续采用项目已有`psys_host_v4`异步WIT接口。
-
-
-### NSH客户端调度修复（0.3.1）
-
-OPEN状态8仅表示PTY正在回收等暂忙，500ms间隔重试，总等待15秒。WRITE状态8在模块`TX.push_all`语义下表示整块未接收，允许原输入块间隔重试，最多5秒；传输错误/丢失应答/其他错误不重发。READ与WRITE/CLOSE共享同一个在途槽，但输入队列独立，读请求不能丢弃用户点击。成功WRITE移除队首一次；Ctrl+C不能越过已发送但未确认的队首命令。停止清理未提交队列，晚到的成功OPEN会被CLOSE回收。
-
-输入与焦点事件不触发宿主render；聚焦期间延迟整页重绘，失焦350ms后刷新，防止失焦引发的重绘吞掉按钮click。输出持续缓存在32KiB有界记录中，输入期间不会停止读取。按现有 [v4 UI render实现](https://github.com/AstralSightStudios/AstroBox-NG-Module-PluginSystem/blob/main/src/v4/host/ui.rs) 继续使用官方Element/UI事件，无新增宿主API或权限。
-
-
-### 原生编辑与插件权限调整（0.3.2）
-
-插件NSH操作不再受插件操作mask 0x20控制；旧配置位兼容保留，Android同位继续有效。无新增或删除载波协议字段。手环连接策略拒绝、停用服务、换会话与超时仍回收PTY lease。
-
-NSH不再创建带Input/Focus/Blur事件的插件输入控件，改用既有`dialog.show_dialog(INPUT,SYSTEM,...)`宿主原生编辑接口；输入结束才返回命令草稿，用户再点击发送。无需新增宿主权限，文件选择与文件管理所需request/device/register权限保留。
+插件只提供文件管理和链路测速；终端入口、输入、状态、定时读取与操作码0x50..0x53的收发处理均已移除。配套模块不再向插件通告终端能力，并拒绝插件调用该组操作。Android端终端协议及其权限继续独立使用。

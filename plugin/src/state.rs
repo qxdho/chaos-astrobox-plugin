@@ -138,7 +138,6 @@ pub enum Pending {
 }
 
 pub struct State {
-    pub terminal:crate::terminal::Terminal,
     pub root: Option<String>,
     pub devices: Vec<DeviceInfo>,
     pub addr: String,
@@ -169,7 +168,6 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            terminal:Default::default(),
             root: None,
             devices: Vec::new(),
             addr: String::new(),
@@ -209,7 +207,6 @@ pub fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> T {
 
 pub fn snapshot() -> State {
     with_state(|state| State {
-        terminal:state.terminal.clone(),
         root: state.root.clone(),
         devices: state.devices.clone(),
         addr: state.addr.clone(),
@@ -286,7 +283,6 @@ pub fn reset_path(path: &str) {
 
 pub fn clear_connection() {
     with_state(|state| {
-        state.terminal=Default::default();
         state.connected = false;
         state.dev_mode = false;
         state.dev_authorization = None;

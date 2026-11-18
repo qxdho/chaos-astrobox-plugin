@@ -135,8 +135,6 @@ pub fn build(state: &State) -> View {
         return root;
     }
 
-    root=root.child(row().child(button("文件管理","terminal:back",!state.terminal.visible)).child(button("NSH终端","terminal:show",state.terminal.visible)));
-    if state.terminal.visible{return root.child(terminal_card(state)).child(status_line(state));}
     root = root.child(path_bar(state));
     root = root.child(toolbar(state));
 
@@ -410,18 +408,4 @@ fn status_line(state: &State) -> View {
         .font_size(12)
         .color(if state.status_error { DANGER } else { MUTED })
         .width_full()
-}
-
-fn terminal_card(state:&State)->View {
-    let t=&state.terminal;
-    card().child(title("NSH终端",20)).child(muted(&t.message)).child(muted(format!("待发送：{}",t.queued())))
-        .child(muted("NSH无需单独授权。点击输入命令，使用原生输入框编辑后再发送。"))
-        .child(View::new(ui::ElementType::P,Some(&t.output)).prop("class","whitespace-pre-wrap break-all max-h-96 overflow-y-auto select-text font-mono").width_full())
-        .child(muted(if t.input.is_empty(){"尚未输入命令"}else{&t.input}))
-        .child(button(if t.input.is_empty(){"输入命令"}else{"修改命令"},"terminal:edit",false).disabled_if(t.editing))
-        .child(row().child(button("启动终端","terminal:start",true).disabled_if(t.busy()||t.active()||t.starting()))
-            .child(button("发送","terminal:send",true).disabled_if(!t.can_send()))
-            .child(button("Ctrl+C","terminal:interrupt",false).disabled_if(!t.can_send()))
-            .child(button("停止","terminal:stop",false).disabled_if(!t.active()&&!t.busy()&&!t.starting()))
-            .child(button("清空输出","terminal:clear",false)))
 }
