@@ -1,0 +1,30 @@
+{
+  "version": "0.3.1",
+  "tests": {
+    "passed": 33,
+    "failed": 0,
+    "skipped": 0
+  },
+  "artifact": {
+    "name": "chaos-connect.abp",
+    "bytes": 170827,
+    "sha256": "96f21e1ec6db61af4e28394a43a6d56e8b63335f67e54ad5bc716f44a6683cb9"
+  },
+  "openBusy": {
+    "retryMillis": 500,
+    "deadlineMillis": 15000
+  },
+  "writeBusy": {
+    "retryMillis": 500,
+    "deadlineMillis": 5000,
+    "retryOnlyExplicitRejection": true
+  },
+  "editor": {
+    "renderOnInput": false,
+    "deferRenderWhileFocused": true,
+    "blurSettleMillis": 350,
+    "maxQueuedCommands": 4,
+    "sendWhileReadPending": true
+  },
+  "hardwareVerified": false
+}

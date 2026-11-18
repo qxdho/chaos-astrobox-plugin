@@ -414,13 +414,13 @@ fn status_line(state: &State) -> View {
 
 fn terminal_card(state:&State)->View {
     let t=&state.terminal;
-    card().child(title("NSH终端",20)).child(muted(&t.message))
+    card().child(title("NSH终端",20)).child(muted(&t.message)).child(muted(format!("待发送：{}",t.queued())))
         .child(muted("需要在手环 ChaosConnect → 插件权限允许 NSH终端。命令在手环独立PTY执行。"))
         .child(View::new(ui::ElementType::P,Some(&t.output)).prop("class","whitespace-pre-wrap break-all max-h-96 overflow-y-auto select-text font-mono").width_full())
-        .child(View::new(ui::ElementType::Input,None).prop("value",&t.input).prop("placeholder","输入NSH命令").on(crate::view::On::Input,"input:nsh").width_full())
-        .child(row().child(button("启动终端","terminal:start",true).disabled_if(t.busy()||t.active()))
-            .child(button("发送","terminal:send",true).disabled_if(t.busy()||!t.active()||t.input.is_empty()))
-            .child(button("Ctrl+C","terminal:interrupt",false).disabled_if(t.busy()||!t.active()))
-            .child(button("停止","terminal:stop",false).disabled_if(!t.active()&&!t.busy()))
+        .child(View::new(ui::ElementType::Input,None).prop("value",&t.input).prop("placeholder","输入NSH命令").on(crate::view::On::Input,"input:nsh").on(crate::view::On::Focus,"terminal:focus").on(crate::view::On::Blur,"terminal:blur").width_full())
+        .child(row().child(button("启动终端","terminal:start",true).disabled_if(t.busy()||t.active()||t.starting()))
+            .child(button("发送","terminal:send",true).disabled_if(!t.can_send()))
+            .child(button("Ctrl+C","terminal:interrupt",false).disabled_if(!t.can_send()))
+            .child(button("停止","terminal:stop",false).disabled_if(!t.active()&&!t.busy()&&!t.starting()))
             .child(button("清空输出","terminal:clear",false)))
 }

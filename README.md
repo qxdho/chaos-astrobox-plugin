@@ -1,6 +1,6 @@
 # Chaos Connect（AstroBox v4）
 
-适配 Chaos 原生文件桥的新私有协议 **ChaosConnect v1**。插件0.3.0不再调用 CanopusConnect，不需要模块管理器；必须同时更新 Chaos 与插件，旧 band_files 插件不兼容。
+适配 Chaos 原生文件桥的新私有协议 **ChaosConnect v1**。插件0.3.1不再调用 CanopusConnect，不需要模块管理器；必须同时更新 Chaos 与插件，旧 band_files 插件不兼容。
 
 ## 使用
 
@@ -74,3 +74,14 @@ sh scripts/build_plugin.sh
 按官方 [v4异步接口](https://abox.run/docs/plugin-development/v4/whats-new) 和现有 UI／Timer／Transport API 接入，无新增宿主权限。终端采用 `0x50..0x53` 与 lease，旧应答／旧会话不能推进新命令；命令不在不确定结果后自动重发。撤权和断连停止访问。最多保留32KiB文字输出，常见ANSI控制序列被过滤，不是完整VT100。可见时约250ms读取，回到文件管理后最多每秒一次；空输出不重复刷新整个页面。
 
 `cargo test --manifest-path plugin/Cargo.toml --lib` 20项通过；`sh scripts/build_plugin.sh` 产出 `dist/chaos-connect.abp`。已验证解析、lease、撤权、分段UTF-8及有界输出，尚未在真实AstroBox与手环上执行命令。需要同时使用支持NSH协议的Chaos版本。
+
+
+## 0.3.1 NSH连接与输入修复
+
+启动时手环可能仍在回收上一轮PTY。插件现在将OPEN的BUSY作为可等待状态，每500ms重试，最多15秒，界面显示回收等待及超时原因；不再直接报文件操作的“目录非空或设备忙”。权限拒绝等错误不会重试。
+
+修复输入框每个字符触发整页重绘造成的卡顿与光标中断：输入事件只保存草稿；聚焦时暂缓整页渲染，NSH输出仍在后台读取并缓存，失焦后再刷新。JSON输入用标准解析器处理中文、引号、反斜杠和Unicode转义。
+
+发送和Ctrl+C通过有界队列进入NSH。正在读取输出时仍可点击发送，READ完成后优先发送命令，发送按钮不再跟随READ忙状态禁用。只有收到明确BUSY（设备未接收任何字节）时才间隔重试写入，最多5秒；已确认写入或发送结果不确定时均不重发。命令队列最多4条，过长／无效输入会保留草稿提示。
+
+需更新插件 `dist/chaos-connect.abp`，可继续使用现有配套Chaos模块。此修复不改变手环PTY回收的所有权规则。33项Rust回归及WASM构建通过；未在本轮操作实体手环。

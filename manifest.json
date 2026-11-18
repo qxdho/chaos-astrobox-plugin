@@ -1,7 +1,7 @@
 {
   "name": "Chaos Connect",
   "icon": "icon.png",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "通过ChaosConnect管理设备文件并连接手环独立NSH终端，支持权限管控、窗口传输与CRC校验。",
   "author": "IKUN_CXKPRO",
   "website": "",

@@ -51,6 +51,9 @@ fn next_req() -> u16 {
 }
 
 fn rerender() {
+    // The host rebuilds this element tree. Preserve focus/caret while editing;
+    // output is still collected and a deferred render is flushed after blur.
+    if state::with_state(|s|{if s.terminal.defer_render(Instant::now()){s.terminal.render_dirty=true;true}else{s.terminal.render_dirty=false;false}}){return;}
     let snapshot = state::snapshot();
     if let Some(root) = &snapshot.root {
         ui::render(root, page::build(&snapshot).into_element());
@@ -529,34 +532,9 @@ fn timer_payload(payload: &str) -> &str {
     }
 }
 
-fn event_value(payload: &str) -> String {
-    let Some(pos) = payload.find("\"value\"") else {
-        return String::new();
-    };
-    let rest = &payload[pos + 7..];
-    let Some(colon) = rest.find(':') else {
-        return String::new();
-    };
-    let rest = rest[colon + 1..].trim_start();
-    if let Some(rest) = rest.strip_prefix('"') {
-        let mut out = String::new();
-        let mut escaped = false;
-        for ch in rest.chars() {
-            if escaped {
-                out.push(ch);
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                break;
-            } else {
-                out.push(ch);
-            }
-        }
-        out
-    } else {
-        String::new()
-    }
+fn event_value(payload:&str)->String {
+    serde_json::from_str::<serde_json::Value>(payload).ok()
+        .and_then(|v|v.get("value").or_else(||v.get("target").and_then(|t|t.get("value"))).unwrap_or(&v).as_str().map(str::to_owned)).unwrap_or_default()
 }
 
 async fn start_upload_bytes(target: String, name: String, data: Vec<u8>) {
@@ -977,50 +955,50 @@ async fn on_read_response(status: u8, payload: &[u8], offset: u32) {
     rerender_progress();
 }
 
-async fn terminal_request(op:u8,data:&[u8]){
-    if !state::with_state(|s|s.connected&&!s.terminal.busy()){return;}
-    let req=next_req();state::with_state(|s|s.terminal.pending=Some((req,op,Instant::now())));
-    if let Err(error)=send_req(op,req,data).await{state::with_state(|s|{s.terminal.pending=None;s.terminal.lease=0;s.terminal.message=format!("NSH发送失败，未自动重发：{error}");});}
-    if op!=0x52{rerender();}
-}
 fn clear_terminal_timer(){if let Some(id)=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner()).take(){timer::clear_timer(id);}}
+fn ensure_terminal_timer()->bool {
+    let mut timer=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner());
+    if timer.is_none(){let id=timer::set_interval(250,"nsh-terminal");if id!=0{*timer=Some(id);}}timer.is_some()
+}
 async fn terminal_tick(){
-    if !state::with_state(|s|s.connected&&(s.terminal.active()||s.terminal.busy())){clear_terminal_timer();return;}
+    if !state::with_state(|s|s.connected&&s.terminal.needs_timer()){clear_terminal_timer();return;}
     if state::with_state(|s|s.terminal.pending.is_some_and(|(_,_,at)|at.elapsed().as_secs()>=10)){
         connection_lost("NSH应答超时，已结束连接；命令不会自动重发").await;return;
     }
     let action=state::with_state(|s|{
-        let t=&mut s.terminal;if !s.connected{return None;}
-        if t.busy()||t.lease==0{return None;}
-        let mut p=t.lease.to_le_bytes().to_vec();
-        if t.closing{return Some((0x53,p));}
-        if !t.visible&&t.last_poll.is_some_and(|at|at.elapsed().as_millis()<1000){return None;}
-        t.last_poll=Some(Instant::now());put_u16(&mut p,s.chunk.min(CHUNK)as u16);Some((0x52,p))
+        if !s.connected{return None;}
+        let before=s.terminal.message.clone();
+        let action=s.terminal.next_action(Instant::now(),s.chunk.min(CHUNK));
+        if s.terminal.message!=before{s.terminal.render_dirty=true;}
+        let (op,payload)=action?;
+        let req=next_req();s.terminal.pending=Some((req,op,Instant::now()));Some((op,req,payload))
     });
-    if let Some((op,p))=action{terminal_request(op,&p).await;}
+    if let Some((op,req,payload))=action{
+        if let Err(error)=send_req(op,req,&payload).await{state::with_state(|s|s.terminal.send_failed(&error));rerender();}
+    }
+    let flush=state::with_state(|s|s.terminal.render_dirty&&!s.terminal.defer_render(Instant::now()));
+    if flush{rerender();}
 }
 async fn terminal_event(id:&str,payload:&str){
     match id {
-        "input:nsh"=>{state::with_state(|s|s.terminal.input=event_value(payload).chars().take(2048).collect());rerender();return;},
+        "input:nsh"=>{state::with_state(|s|s.terminal.edit(event_value(payload),Instant::now()));return;},
+        "terminal:focus"=>{state::with_state(|s|s.terminal.focus(true,Instant::now()));return;},
+        "terminal:blur"=>{state::with_state(|s|s.terminal.focus(false,Instant::now()));return;},
         "terminal:show"=>state::with_state(|s|s.terminal.visible=true),
-        "terminal:back"=>state::with_state(|s|s.terminal.visible=false),
+        "terminal:back"=>state::with_state(|s|{s.terminal.visible=false;s.terminal.focus(false,Instant::now());}),
         "terminal:clear"=>state::with_state(|s|s.terminal.output.clear()),
-        "terminal:stop"=>{state::with_state(|s|s.terminal.closing=true);terminal_tick().await;},
+        "terminal:stop"=>{state::with_state(|s|s.terminal.stop());terminal_tick().await;},
         "terminal:start"=>{
             if state::with_state(|s|s.upload.is_some()||s.download.is_some()||s.benchmark.is_some()){state::set_status("请先完成文件传输或测速",true);rerender();return;}
-            state::with_state(|s|{s.terminal.closing=false;s.terminal.message="正在启动NSH终端…".into();});
-            let supported=state::with_state(|s|s.terminal.supported);if !supported{state::with_state(|s|s.terminal.message="请更新支持NSH的Chaos模块".into());rerender();return;}
-            terminal_request(0x50,&[]).await;
-            let ready={let mut timer=TERMINAL_TIMER.lock().unwrap_or_else(|e|e.into_inner());
-                if timer.is_none(){let id=timer::set_interval(250,"nsh-terminal");if id!=0{*timer=Some(id);}}timer.is_some()};
-            if !ready{connection_lost("无法启动NSH读取定时器，已结束连接；请重新连接").await;return;}
+            if !state::with_state(|s|s.terminal.supported){state::with_state(|s|s.terminal.message="请更新支持NSH的Chaos模块".into());rerender();return;}
+            state::with_state(|s|s.terminal.begin_open(Instant::now()));
+            if !ensure_terminal_timer(){connection_lost("无法启动NSH读取定时器，已结束连接；请重新连接").await;return;}
+            terminal_tick().await;
         },
         "terminal:send"|"terminal:interrupt"=>{
-            let data=state::with_state(|s|{let t=&mut s.terminal;if !t.active()||t.busy()||t.closing{return None;}
-                let input=if id=="terminal:interrupt"{vec![3]}else{let mut bytes=t.input.as_bytes().to_vec();bytes.push(b'\n');bytes};
-                if input.len()>s.chunk||input.iter().any(|b|*b==0||*b==4){t.message="输入超过协商长度或包含不支持的字符".into();return None;}
-                let mut p=t.lease.to_le_bytes().to_vec();p.extend_from_slice(&input);t.input.clear();Some(p)});
-            if let Some(p)=data{terminal_request(0x51,&p).await;}
+            state::with_state(|s|{if let Err(e)=s.terminal.enqueue(id=="terminal:interrupt",s.chunk){s.terminal.message=e;}});
+            // An outstanding READ simply finishes before the queued WRITE.
+            terminal_tick().await;
         },_=>{}
     }rerender();
 }
@@ -1834,8 +1812,9 @@ async fn receive_frame(packet:&[u8]){
         };
         if (0x50..=0x53).contains(&response.op){
             let changed=state::with_state(|s|{let before=(s.terminal.output.clone(),s.terminal.message.clone(),s.terminal.lease,s.terminal.pending.is_some());
-                if let Err(e)=s.terminal.apply(&response){s.terminal.message=e;s.terminal.lease=0;}
+                if let Err(e)=s.terminal.apply(&response){s.terminal.send_failed(&e);}
                 before.0!=s.terminal.output||before.1!=s.terminal.message||before.2!=s.terminal.lease||(response.op!=0x52&&before.3)});
+            terminal_tick().await;
             if changed{rerender_progress();}return;
         }
         if response.op==OP_PING{
@@ -2010,5 +1989,14 @@ mod timer_tests {
             timer_payload(r#"{"kind":"timeout","payload":"hello-timeout"}"#),
             "hello-timeout"
         );
+    }
+}
+
+#[cfg(test)]mod terminal_input_tests {
+    #[test]fn host_input_payload_keeps_json_escapes_and_unicode(){
+        assert_eq!(super::event_value(r#"{"value":"echo \"中文\" C:\\data\n\uD83D\uDE00"}"#),"echo \"中文\" C:\\data\n😀");
+        assert_eq!(super::event_value(r#"{"target":{"value":"pwd"}}"#),"pwd");
+        assert_eq!(super::event_value(r#""ls /data""#),"ls /data");
+        assert_eq!(super::event_value("malformed"),"");
     }
 }

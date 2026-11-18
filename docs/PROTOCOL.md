@@ -116,3 +116,10 @@ HELLO capabilities bit `0x10` 表示独立NSH后端可用。插件由实际载�
 state：0空闲／1启动中／2运行中／3已退出／4失败／5停止中。所有操作绑定当前连接prefix与lease。一次只有一个NSH请求在途；写入失败或超时不重发命令，10秒无应答结束连接。启动时不与文件传输／测速同时发起。停止期间等待当前应答后关闭已打开的lease；服务停用、设备切换、断线清空本地状态。每次读取/输入仍由模块执行插件NSH权限门禁。
 
 参考：[v4概览](https://abox.run/docs/plugin-development/v4)、[UI](https://abox.run/docs/plugin-development/v2/host-api/ui-v3)、[Timer](https://abox.run/docs/plugin-development/v2/host-api/timer)、[Transport](https://abox.run/docs/plugin-development/v2/host-api/transport)。v4继续采用项目已有`psys_host_v4`异步WIT接口。
+
+
+### NSH客户端调度修复（0.3.1）
+
+OPEN状态8仅表示PTY正在回收等暂忙，500ms间隔重试，总等待15秒。WRITE状态8在模块`TX.push_all`语义下表示整块未接收，允许原输入块间隔重试，最多5秒；传输错误/丢失应答/其他错误不重发。READ与WRITE/CLOSE共享同一个在途槽，但输入队列独立，读请求不能丢弃用户点击。成功WRITE移除队首一次；Ctrl+C不能越过已发送但未确认的队首命令。停止清理未提交队列，晚到的成功OPEN会被CLOSE回收。
+
+输入与焦点事件不触发宿主render；聚焦期间延迟整页重绘，失焦350ms后刷新，防止失焦引发的重绘吞掉按钮click。输出持续缓存在32KiB有界记录中，输入期间不会停止读取。按现有 [v4 UI render实现](https://github.com/AstralSightStudios/AstroBox-NG-Module-PluginSystem/blob/main/src/v4/host/ui.rs) 继续使用官方Element/UI事件，无新增宿主API或权限。
