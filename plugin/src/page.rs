@@ -415,9 +415,10 @@ fn status_line(state: &State) -> View {
 fn terminal_card(state:&State)->View {
     let t=&state.terminal;
     card().child(title("NSH终端",20)).child(muted(&t.message)).child(muted(format!("待发送：{}",t.queued())))
-        .child(muted("需要在手环 ChaosConnect → 插件权限允许 NSH终端。命令在手环独立PTY执行。"))
+        .child(muted("NSH无需单独授权。点击输入命令，使用原生输入框编辑后再发送。"))
         .child(View::new(ui::ElementType::P,Some(&t.output)).prop("class","whitespace-pre-wrap break-all max-h-96 overflow-y-auto select-text font-mono").width_full())
-        .child(View::new(ui::ElementType::Input,None).prop("value",&t.input).prop("placeholder","输入NSH命令").on(crate::view::On::Input,"input:nsh").on(crate::view::On::Focus,"terminal:focus").on(crate::view::On::Blur,"terminal:blur").width_full())
+        .child(muted(if t.input.is_empty(){"尚未输入命令"}else{&t.input}))
+        .child(button(if t.input.is_empty(){"输入命令"}else{"修改命令"},"terminal:edit",false).disabled_if(t.editing))
         .child(row().child(button("启动终端","terminal:start",true).disabled_if(t.busy()||t.active()||t.starting()))
             .child(button("发送","terminal:send",true).disabled_if(!t.can_send()))
             .child(button("Ctrl+C","terminal:interrupt",false).disabled_if(!t.can_send()))

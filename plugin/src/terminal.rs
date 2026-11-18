@@ -5,7 +5,6 @@ use crate::protocol::{get_u32, Response};
 const OPEN_WAIT: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 const WRITE_WAIT: Duration = Duration::from_secs(5);
-const EDIT_SETTLE: Duration = Duration::from_millis(350);
 const MAX_COMMANDS: usize = 4;
 
 #[derive(Clone)]
@@ -16,15 +15,15 @@ pub struct Terminal {
     pub last_poll: Option<Instant>, pub render_dirty: bool,
     opening: Option<Instant>, open_retry: Option<Instant>,
     commands: VecDeque<Vec<u8>>, write_retry: Option<Instant>, write_busy_since: Option<Instant>,
-    focused: bool, render_after: Option<Instant>,
+    pub editing: bool,
     tail: Vec<u8>, escape: u8,
 }
 impl Default for Terminal {
     fn default() -> Self { Self {
         visible:false, supported:false, lease:0, state:0, output:String::new(), input:String::new(),
-        message:"需要手环允许插件 NSH终端权限".into(), pending:None, closing:false, last_poll:None,
+        message:"连接ChaosConnect后即可启动NSH终端".into(), pending:None, closing:false, last_poll:None,
         opening:None, open_retry:None, commands:VecDeque::new(), write_retry:None, write_busy_since:None,
-        focused:false, render_after:None, render_dirty:false, tail:Vec::new(), escape:0,
+        editing:false, render_dirty:false, tail:Vec::new(), escape:0,
     }}
 }
 impl Terminal {
@@ -34,9 +33,9 @@ impl Terminal {
     pub fn needs_timer(&self)->bool { self.active()||self.busy()||self.starting()||self.render_dirty }
     pub fn can_send(&self)->bool { self.active() && matches!(self.state,1|2) && !self.closing && self.commands.len()<MAX_COMMANDS }
     pub fn queued(&self)->usize { self.commands.len() }
-    pub fn focus(&mut self, focused:bool, now:Instant) { self.focused=focused;self.render_after=if focused{None}else{Some(now+EDIT_SETTLE)}; }
-    pub fn edit(&mut self,value:String,now:Instant) { self.input=value.chars().take(2048).collect();self.focus(true,now); }
-    pub fn defer_render(&self,now:Instant)->bool { self.visible && (self.focused||self.render_after.is_some_and(|until|now<until)) }
+    pub fn edit(&mut self,value:String,_now:Instant) { self.input=value.chars().take(2048).collect(); }
+    pub fn finish_edit(&mut self,value:Option<String>,now:Instant) {self.editing=false;if let Some(value)=value{self.edit(value,now);}}
+    pub fn defer_render(&self,_now:Instant)->bool { self.visible && self.editing }
     pub fn begin_open(&mut self,now:Instant) {
         if self.active()||self.busy()||self.starting(){return;}
         self.opening=Some(now);self.open_retry=Some(now);self.closing=false;
@@ -86,7 +85,7 @@ impl Terminal {
         self.last_poll=Some(now);p.extend_from_slice(&(chunk as u16).to_le_bytes());Some((0x52,p))
     }
     pub fn send_failed(&mut self,error:&str) {
-        self.pending=None;self.lease=0;self.stop();self.focused=false;
+        self.pending=None;self.lease=0;self.stop();self.editing=false;
         self.message=format!("NSH发送失败，命令不会自动重发：{error}");
     }
     pub fn apply(&mut self,r:&Response<'_>)->Result<(),String>{self.apply_at(r,Instant::now())}
@@ -105,7 +104,7 @@ impl Terminal {
             self.message="NSH输入队列暂忙，等待接收…".into();return Ok(());
         }
         if r.status!=0 {
-            self.lease=0;self.stop();self.focused=false;
+            self.lease=0;self.stop();self.editing=false;
             self.message=format!("NSH：{}",crate::protocol::status_text(r.status));return Err(self.message.clone());
         }
         if op==0x51||op==0x53 {
@@ -172,7 +171,7 @@ mod tests {
         for i in 0..30{let at=now+Duration::from_millis(i*500);assert_eq!(t.next_action(at,2048).unwrap().0,0x50);reply(&mut t,0x50,8,&[],at);}
         assert!(t.next_action(now+OPEN_WAIT,2048).is_none());assert!(!t.starting());assert!(!t.active());assert!(t.message.contains("尚未回收"));
     }
-    #[test] fn permission_denied_is_not_retried_as_busy(){
+    #[test] fn connection_denied_is_not_retried_as_busy(){
         let now=Instant::now();let mut t=Terminal::default();t.begin_open(now);t.pending=Some((5,0x50,now));
         assert!(t.apply_at(&Response{op:0x50,req:5,status:3,payload:&[]},now).is_err());
         assert!(!t.starting());assert!(t.next_action(now+RETRY_DELAY,2048).is_none());
@@ -199,11 +198,16 @@ mod tests {
         let now=Instant::now();let mut t=running();t.input="pwd".into();t.enqueue(false,2048).unwrap();reply(&mut t,0x51,8,&[],now);
         let action=t.next_action(now+WRITE_WAIT,2048).unwrap();assert_eq!(action.0,0x52);assert_eq!(t.queued(),0);assert!(t.active());assert!(t.message.contains("未被接收"));
     }
-    #[test] fn editor_defers_render_until_blur_and_preserves_escapes(){
-        let now=Instant::now();let mut t=running();t.edit("echo \"中文\\path\"".into(),now);
-        assert!(t.defer_render(now+Duration::from_secs(30)));assert_eq!(t.input,"echo \"中文\\path\"");
-        t.focus(false,now);assert!(t.defer_render(now+EDIT_SETTLE-Duration::from_millis(1)));
-        assert!(!t.defer_render(now+EDIT_SETTLE));
+    #[test] fn native_editor_defers_render_until_dialog_finishes_and_keeps_draft(){
+        let now=Instant::now();let mut t=running();t.editing=true;
+        assert!(t.defer_render(now+Duration::from_secs(30)));
+        t.edit("echo \"中文\\path\"".into(),now);t.editing=false;
+        assert_eq!(t.input,"echo \"中文\\path\"");assert!(!t.defer_render(now));
+    }
+    #[test] fn cancelling_native_editor_retains_unsent_draft(){
+        let now=Instant::now();let mut t=running();t.input="echo keep".into();t.editing=true;t.finish_edit(None,now);
+        assert_eq!(t.input,"echo keep");assert!(!t.editing);assert_eq!(t.queued(),0);
+        t.editing=true;t.finish_edit(Some("pwd".into()),now);assert_eq!(t.input,"pwd");assert!(!t.editing);
     }
     #[test] fn input_validation_preserves_draft_and_queue_is_bounded(){
         let now=Instant::now();let mut t=running();t.edit("你好".into(),now);
@@ -218,5 +222,5 @@ mod tests {
     }
     #[test] fn split_utf8_ansi_and_bounded_history(){let mut t=Terminal::default();t.append(&[0xe4,0xbd]);t.append(&[0xa0]);t.append(b"\x1b[31mhi\x1b[0m\x1b]title\x07\n");assert_eq!(t.output,"你hi\n");t.append("字".repeat(20000).as_bytes());assert!(t.output.len()<=32768);}
     #[test] fn ignores_old_request_and_rejects_wrong_lease(){let now=Instant::now();let mut t=running();t.pending=Some((5,0x52,now));assert!(t.apply_at(&Response{op:0x52,req:4,status:0,payload:&[99,0,0,0,2,0,0,0,0]},now).is_ok());assert_eq!(t.lease,7);assert!(t.busy());assert!(t.apply_at(&Response{op:0x52,req:5,status:0,payload:&[99,0,0,0,2,0,0,0,0]},now).is_err());}
-    #[test] fn revoked_permission_stops_console(){let now=Instant::now();let mut t=running();t.pending=Some((3,0x52,now));assert!(t.apply_at(&Response{op:0x52,req:3,status:3,payload:&[]},now).is_err());assert_eq!(t.lease,0);assert!(!t.can_send());}
+    #[test] fn connection_revocation_stops_console(){let now=Instant::now();let mut t=running();t.pending=Some((3,0x52,now));assert!(t.apply_at(&Response{op:0x52,req:3,status:3,payload:&[]},now).is_err());assert_eq!(t.lease,0);assert!(!t.can_send());}
 }

@@ -51,8 +51,8 @@ fn next_req() -> u16 {
 }
 
 fn rerender() {
-    // The host rebuilds this element tree. Preserve focus/caret while editing;
-    // output is still collected and a deferred render is flushed after blur.
+    // Native command editing stays inside the host. Collect output in the
+    // background and render once after the dialog, without per-key callbacks.
     if state::with_state(|s|{if s.terminal.defer_render(Instant::now()){s.terminal.render_dirty=true;true}else{s.terminal.render_dirty=false;false}}){return;}
     let snapshot = state::snapshot();
     if let Some(root) = &snapshot.root {
@@ -979,13 +979,18 @@ async fn terminal_tick(){
     let flush=state::with_state(|s|s.terminal.render_dirty&&!s.terminal.defer_render(Instant::now()));
     if flush{rerender();}
 }
-async fn terminal_event(id:&str,payload:&str){
+async fn terminal_event(id:&str,_payload:&str){
     match id {
-        "input:nsh"=>{state::with_state(|s|s.terminal.edit(event_value(payload),Instant::now()));return;},
-        "terminal:focus"=>{state::with_state(|s|s.terminal.focus(true,Instant::now()));return;},
-        "terminal:blur"=>{state::with_state(|s|s.terminal.focus(false,Instant::now()));return;},
+        "terminal:edit"=>{
+            let context=PREFIX.load(Ordering::SeqCst);
+            let current=state::with_state(|s|{if s.terminal.editing{return None;}s.terminal.editing=true;Some(s.terminal.input.clone())});
+            let Some(current)=current else{return;};
+            let prompt=if current.is_empty(){"输入NSH命令，确定后点击发送。".to_string()}else{format!("当前待发送：{current}\n输入新的NSH命令，确定后点击发送。")};
+            let value=dialog_input("NSH命令",&prompt).await;
+            state::with_state(|s|s.terminal.finish_edit(if context==PREFIX.load(Ordering::SeqCst){value}else{None},Instant::now()));
+        },
         "terminal:show"=>state::with_state(|s|s.terminal.visible=true),
-        "terminal:back"=>state::with_state(|s|{s.terminal.visible=false;s.terminal.focus(false,Instant::now());}),
+        "terminal:back"=>state::with_state(|s|{s.terminal.visible=false;}),
         "terminal:clear"=>state::with_state(|s|s.terminal.output.clear()),
         "terminal:stop"=>{state::with_state(|s|s.terminal.stop());terminal_tick().await;},
         "terminal:start"=>{
@@ -1004,7 +1009,7 @@ async fn terminal_event(id:&str,payload:&str){
 }
 
 async fn handle_ui_event(event_id: &str, payload: &str) {
-    if event_id.starts_with("terminal:")||event_id=="input:nsh"{terminal_event(event_id,payload).await;return;}
+    if event_id.starts_with("terminal:"){terminal_event(event_id,payload).await;return;}
     if state::with_state(|s|s.dev_authorization.is_some())&&event_id!="action:cancel-authorization"{
         state::set_status("请先在手环完成授权，或取消本次请求。",false);rerender();return;
     }

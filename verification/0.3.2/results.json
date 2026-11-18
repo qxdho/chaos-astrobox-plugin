@@ -1,0 +1,18 @@
+{
+  "version": "0.3.2",
+  "tests": {
+    "passed": 34,
+    "failed": 0,
+    "skipped": 0
+  },
+  "moduleProtocolTests": 31,
+  "pluginNshPermissionRequired": false,
+  "androidNshPermissionUnchanged": true,
+  "input": "host native dialog, no per-key plugin callbacks",
+  "artifact": {
+    "name": "chaos-connect.abp",
+    "bytes": 170789,
+    "sha256": "d4d9e30da0f419929c153dc53e76222589a90a4f197eea31b8c8f8c67fed8f0c"
+  },
+  "hardwareVerified": false
+}
